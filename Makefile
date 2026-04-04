@@ -5,7 +5,7 @@ LDFLAGS = -L/usr/local/lib -lvulkan -lsodium -pthread
 GLSLC ?= glslc
 
 TARGET = tor_vanity_vk
-SRCS = main.c
+SRCS = main.c fe.c ge.c sc.c
 OBJS = $(SRCS:.c=.o)
 SHADER = shader.spv
 

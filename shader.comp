@@ -6,15 +6,33 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, set = 0, binding = 0) readonly buffer BasePubkeys {
-    uint8_t base_pubkeys[];
+struct ge_p3 {
+    int X[10];
+    int Y[10];
+    int Z[10];
+    int T[10];
 };
 
-layout(std430, set = 0, binding = 1) readonly buffer TargetPrefix {
+struct ge_cached {
+    int YplusX[10];
+    int YminusX[10];
+    int Z[10];
+    int T2d[10];
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer BasePoint {
+    ge_p3 base_point;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer OffsetPoints {
+    ge_cached offsets[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer TargetPrefix {
     uint8_t target_prefix[];
 };
 
-layout(std430, set = 0, binding = 2) buffer ResultBuffer {
+layout(std430, set = 0, binding = 3) buffer ResultBuffer {
     int result_index;
 };
 
@@ -43,7 +61,6 @@ void keccakf(inout uint64_t st[25]) {
     int round;
     uint64_t t, bc[5];
     for (round = 0; round < 24; ++round) {
-        // Theta
         bc[0] = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
         bc[1] = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
         bc[2] = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
@@ -56,7 +73,6 @@ void keccakf(inout uint64_t st[25]) {
         t = bc[2] ^ ROL64(bc[4], 1); st[3] ^= t; st[8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t;
         t = bc[3] ^ ROL64(bc[0], 1); st[4] ^= t; st[9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t;
 
-        // Rho Pi
         t = st[1];
         bc[0] = st[10]; st[10] = ROL64(t, 1); t = bc[0];
         bc[0] = st[7]; st[7] = ROL64(t, 3); t = bc[0];
@@ -83,7 +99,6 @@ void keccakf(inout uint64_t st[25]) {
         bc[0] = st[6]; st[6] = ROL64(t, 20); t = bc[0];
         st[1] = ROL64(t, 44);
 
-        // Chi
         bc[0] = st[0]; bc[1] = st[1]; bc[2] = st[2]; bc[3] = st[3]; bc[4] = st[4];
         st[0] = bc[0] ^ (~bc[1] & bc[2]); st[1] = bc[1] ^ (~bc[2] & bc[3]); st[2] = bc[2] ^ (~bc[3] & bc[4]); st[3] = bc[3] ^ (~bc[4] & bc[0]); st[4] = bc[4] ^ (~bc[0] & bc[1]);
         bc[0] = st[5]; bc[1] = st[6]; bc[2] = st[7]; bc[3] = st[8]; bc[4] = st[9];
@@ -95,7 +110,6 @@ void keccakf(inout uint64_t st[25]) {
         bc[0] = st[20]; bc[1] = st[21]; bc[2] = st[22]; bc[3] = st[23]; bc[4] = st[24];
         st[20] = bc[0] ^ (~bc[1] & bc[2]); st[21] = bc[1] ^ (~bc[2] & bc[3]); st[22] = bc[2] ^ (~bc[3] & bc[4]); st[23] = bc[3] ^ (~bc[4] & bc[0]); st[24] = bc[4] ^ (~bc[0] & bc[1]);
 
-        // Iota
         st[0] ^= keccakf_rndc[round];
     }
 }
@@ -111,57 +125,294 @@ const uint8_t onion_prefix[15] = uint8_t[15](
     uint8_t(99), uint8_t(104), uint8_t(101), uint8_t(99), uint8_t(107), uint8_t(115), uint8_t(117), uint8_t(109)
 );
 
-// We emulate uint8_t access in the state by accessing the 64-bit uint array.
-// GLSL has endianness to consider, but typically Vulkan buffers map cleanly.
-// We pack bytes into uint64_t manually to avoid alignment/endianness headaches.
 uint64_t pack_bytes(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5, uint8_t b6, uint8_t b7) {
     return uint64_t(b0) | (uint64_t(b1) << 8) | (uint64_t(b2) << 16) | (uint64_t(b3) << 24) |
            (uint64_t(b4) << 32) | (uint64_t(b5) << 40) | (uint64_t(b6) << 48) | (uint64_t(b7) << 56);
 }
 
-void pubkey_to_base32_prefix(uint id_offset, out uint8_t out_prefix[16], uint len) {
+// ==== ED25519 FIELD MATH IN GLSL ====
+void fe_add(out int h[10], in int f[10], in int g[10]) {
+    for (int i=0; i<10; i++) h[i] = f[i] + g[i];
+}
+
+void fe_sub(out int h[10], in int f[10], in int g[10]) {
+    for (int i=0; i<10; i++) h[i] = f[i] - g[i];
+}
+
+void fe_mul(out int h[10], in int f[10], in int g[10]) {
+    int64_t f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4];
+    int64_t f5 = f[5], f6 = f[6], f7 = f[7], f8 = f[8], f9 = f[9];
+    int64_t g0 = g[0], g1 = g[1], g2 = g[2], g3 = g[3], g4 = g[4];
+    int64_t g5 = g[5], g6 = g[6], g7 = g[7], g8 = g[8], g9 = g[9];
+    int64_t g1_19 = 19l * g1, g2_19 = 19l * g2, g3_19 = 19l * g3, g4_19 = 19l * g4;
+    int64_t g5_19 = 19l * g5, g6_19 = 19l * g6, g7_19 = 19l * g7, g8_19 = 19l * g8, g9_19 = 19l * g9;
+
+    int64_t h0 = f0*g0 + f1*g9_19 + f2*g8_19 + f3*g7_19 + f4*g6_19 + f5*g5_19 + f6*g4_19 + f7*g3_19 + f8*g2_19 + f9*g1_19;
+    int64_t h1 = f0*g1 + f1*g0    + f2*g9_19 + f3*g8_19 + f4*g7_19 + f5*g6_19 + f6*g5_19 + f7*g4_19 + f8*g3_19 + f9*g2_19;
+    int64_t h2 = f0*g2 + f1*g1    + f2*g0    + f3*g9_19 + f4*g8_19 + f5*g7_19 + f6*g6_19 + f7*g5_19 + f8*g4_19 + f9*g3_19;
+    int64_t h3 = f0*g3 + f1*g2    + f2*g1    + f3*g0    + f4*g9_19 + f5*g8_19 + f6*g7_19 + f7*g6_19 + f8*g5_19 + f9*g4_19;
+    int64_t h4 = f0*g4 + f1*g3    + f2*g2    + f3*g1    + f4*g0    + f5*g9_19 + f6*g8_19 + f7*g7_19 + f8*g6_19 + f9*g5_19;
+    int64_t h5 = f0*g5 + f1*g4    + f2*g3    + f3*g2    + f4*g1    + f5*g0    + f6*g9_19 + f7*g8_19 + f8*g7_19 + f9*g6_19;
+    int64_t h6 = f0*g6 + f1*g5    + f2*g4    + f3*g3    + f4*g2    + f5*g1    + f6*g0    + f7*g9_19 + f8*g8_19 + f9*g7_19;
+    int64_t h7 = f0*g7 + f1*g6    + f2*g5    + f3*g4    + f4*g3    + f5*g2    + f6*g1    + f7*g0    + f8*g9_19 + f9*g8_19;
+    int64_t h8 = f0*g8 + f1*g7    + f2*g6    + f3*g5    + f4*g4    + f5*g3    + f6*g2    + f7*g1    + f8*g0    + f9*g9_19;
+    int64_t h9 = f0*g9 + f1*g8    + f2*g7    + f3*g6    + f4*g5    + f5*g4    + f6*g3    + f7*g2    + f8*g1    + f9*g0;
+
+    int64_t carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
+
+    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+    carry1 = (h1 + (int64_t(1) << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
+    carry2 = (h2 + (int64_t(1) << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
+    carry3 = (h3 + (int64_t(1) << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
+    carry4 = (h4 + (int64_t(1) << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
+    carry5 = (h5 + (int64_t(1) << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
+    carry6 = (h6 + (int64_t(1) << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
+    carry7 = (h7 + (int64_t(1) << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
+    carry8 = (h8 + (int64_t(1) << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
+    carry9 = (h9 + (int64_t(1) << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
+    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+
+    h[0]=int(h0); h[1]=int(h1); h[2]=int(h2); h[3]=int(h3); h[4]=int(h4);
+    h[5]=int(h5); h[6]=int(h6); h[7]=int(h7); h[8]=int(h8); h[9]=int(h9);
+}
+
+void fe_sq(out int h[10], in int f[10]) {
+    int64_t f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4];
+    int64_t f5 = f[5], f6 = f[6], f7 = f[7], f8 = f[8], f9 = f[9];
+
+    int64_t f0_2 = 2l*f0, f1_2 = 2l*f1, f2_2 = 2l*f2, f3_2 = 2l*f3, f4_2 = 2l*f4;
+    int64_t f5_2 = 2l*f5, f6_2 = 2l*f6, f7_2 = 2l*f7, f8_2 = 2l*f8;
+    int64_t f5_38 = 38l*f5, f6_38 = 38l*f6, f7_38 = 38l*f7, f8_38 = 38l*f8, f9_38 = 38l*f9;
+
+    int64_t h0 = f0*f0 + f1_2*f9_38 + f2_2*f8_38 + f3_2*f7_38 + f4_2*f6_38 + f5*f5_38;
+    int64_t h1 = f0_2*f1 + f2_2*f9_38 + f3_2*f8_38 + f4_2*f7_38 + f5_2*f6_38;
+    int64_t h2 = f0_2*f2 + f1*f1_2 + f3_2*f9_38 + f4_2*f8_38 + f5_2*f7_38 + f6*f6_38;
+    int64_t h3 = f0_2*f3 + f1_2*f2 + f4_2*f9_38 + f5_2*f8_38 + f6_2*f7_38;
+    int64_t h4 = f0_2*f4 + f1_2*f3 + f2*f2_2 + f5_2*f9_38 + f6_2*f8_38 + f7*f7_38;
+    int64_t h5 = f0_2*f5 + f1_2*f4 + f2_2*f3 + f6_2*f9_38 + f7_2*f8_38;
+    int64_t h6 = f0_2*f6 + f1_2*f5 + f2_2*f4 + f3*f3_2 + f7_2*f9_38 + f8*f8_38;
+    int64_t h7 = f0_2*f7 + f1_2*f6 + f2_2*f5 + f3_2*f4 + f8_2*f9_38;
+    int64_t h8 = f0_2*f8 + f1_2*f7 + f2_2*f6 + f3_2*f5 + f4*f4_2 + f9*f9_38;
+    int64_t h9 = f0_2*f9 + f1_2*f8 + f2_2*f7 + f3_2*f6 + f4_2*f5;
+
+    int64_t carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
+
+    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+    carry1 = (h1 + (int64_t(1) << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
+    carry2 = (h2 + (int64_t(1) << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
+    carry3 = (h3 + (int64_t(1) << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
+    carry4 = (h4 + (int64_t(1) << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
+    carry5 = (h5 + (int64_t(1) << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
+    carry6 = (h6 + (int64_t(1) << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
+    carry7 = (h7 + (int64_t(1) << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
+    carry8 = (h8 + (int64_t(1) << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
+    carry9 = (h9 + (int64_t(1) << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
+    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+
+    h[0]=int(h0); h[1]=int(h1); h[2]=int(h2); h[3]=int(h3); h[4]=int(h4);
+    h[5]=int(h5); h[6]=int(h6); h[7]=int(h7); h[8]=int(h8); h[9]=int(h9);
+}
+
+void ge_madd(out int r_X[10], out int r_Y[10], out int r_Z[10], out int r_T[10],
+             in int p_X[10], in int p_Y[10], in int p_Z[10], in int p_T[10],
+             in int q_YplusX[10], in int q_YminusX[10], in int q_Z[10], in int q_T2d[10])
+{
+    int t0[10], A[10], B[10], C[10], D[10];
+
+    // r->X = p->Y + p->X
+    fe_add(A, p_Y, p_X);
+    // r->Y = p->Y - p->X
+    fe_sub(B, p_Y, p_X);
+    // r->Z = r->X * q->yplusx
+    fe_mul(C, A, q_YplusX);
+    // r->Y = r->Y * q->yminusx
+    fe_mul(B, B, q_YminusX);
+    // r->T = q->xy2d * p->T
+    fe_mul(D, q_T2d, p_T);
+    // t0 = p->Z + p->Z
+    fe_add(t0, p_Z, p_Z);
+    // t0 = t0 * q->Z
+    int t1[10];
+    fe_mul(t1, t0, q_Z);
+
+    // r->X = C - B
+    fe_sub(A, C, B);
+    // r->Y = C + B
+    fe_add(B, C, B);
+    // r->Z = t1 + D
+    fe_add(C, t1, D);
+    // r->T = t1 - D
+    fe_sub(D, t1, D);
+
+    // p1p1 to p3
+    // r->X = p->X * p->T
+    fe_mul(r_X, A, D);
+    // r->Y = p->Y * p->Z
+    fe_mul(r_Y, B, C);
+    // r->Z = p->Z * p->T
+    fe_mul(r_Z, C, D);
+    // r->T = p->X * p->Y
+    fe_mul(r_T, A, B);
+}
+
+void fe_invert(out int out_fe[10], in int z[10]) {
+    int t0[10], t1[10], t2[10], t3[10];
+
+    fe_sq(t0, z);
+    fe_sq(t1, t0);
+    fe_sq(t1, t1);
+    fe_mul(t1, z, t1);
+    fe_mul(t0, t0, t1);
+    fe_sq(t2, t0);
+    fe_mul(t1, t1, t2);
+    fe_sq(t2, t1);
+    for(int i=1;i<5;++i) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for(int i=1;i<10;++i) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for(int i=1;i<20;++i) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    fe_sq(t2, t2);
+    for(int i=1;i<10;++i) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for(int i=1;i<50;++i) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for(int i=1;i<100;++i) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    fe_sq(t2, t2);
+    for(int i=1;i<50;++i) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t1, t1);
+    for(int i=1;i<5;++i) fe_sq(t1, t1);
+    fe_mul(out_fe, t1, t0);
+}
+
+void fe_tobytes(out uint8_t s[32], in int h[10]) {
+    int h0=h[0], h1=h[1], h2=h[2], h3=h[3], h4=h[4];
+    int h5=h[5], h6=h[6], h7=h[7], h8=h[8], h9=h[9];
+    int q0, q1, q2, q3, q4, q5, q6, q7, q8, q9;
+    int carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
+
+    carry0 = (h0 + (1 << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+    carry1 = (h1 + (1 << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
+    carry2 = (h2 + (1 << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
+    carry3 = (h3 + (1 << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
+    carry4 = (h4 + (1 << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
+    carry5 = (h5 + (1 << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
+    carry6 = (h6 + (1 << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
+    carry7 = (h7 + (1 << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
+    carry8 = (h8 + (1 << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
+    carry9 = (h9 + (1 << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
+    carry0 = (h0 + (1 << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
+    carry1 = (h1 + (1 << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
+    carry2 = (h2 + (1 << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
+    carry3 = (h3 + (1 << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
+    carry4 = (h4 + (1 << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
+    carry5 = (h5 + (1 << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
+    carry6 = (h6 + (1 << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
+    carry7 = (h7 + (1 << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
+    carry8 = (h8 + (1 << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
+
+    q0 = h0 + 19;
+    q1 = h1 + (q0 >> 26); q0 &= 0x3ffffff;
+    q2 = h2 + (q1 >> 25); q1 &= 0x1ffffff;
+    q3 = h3 + (q2 >> 26); q2 &= 0x3ffffff;
+    q4 = h4 + (q3 >> 25); q3 &= 0x1ffffff;
+    q5 = h5 + (q4 >> 26); q4 &= 0x3ffffff;
+    q6 = h6 + (q5 >> 25); q5 &= 0x1ffffff;
+    q7 = h7 + (q6 >> 26); q6 &= 0x3ffffff;
+    q8 = h8 + (q7 >> 25); q7 &= 0x1ffffff;
+    q9 = h9 + (q8 >> 26); q8 &= 0x3ffffff;
+
+    q9 = (q9 >> 25) & 1;
+    h0 += 19 * q9;
+    h1 += h0 >> 26; h0 &= 0x3ffffff;
+    h2 += h1 >> 25; h1 &= 0x1ffffff;
+    h3 += h2 >> 26; h2 &= 0x3ffffff;
+    h4 += h3 >> 25; h3 &= 0x1ffffff;
+    h5 += h4 >> 26; h4 &= 0x3ffffff;
+    h6 += h5 >> 25; h5 &= 0x1ffffff;
+    h7 += h6 >> 26; h6 &= 0x3ffffff;
+    h8 += h7 >> 25; h7 &= 0x1ffffff;
+    h9 += h8 >> 26; h8 &= 0x3ffffff;
+
+    s[0] = uint8_t(h0 >> 0); s[1] = uint8_t(h0 >> 8); s[2] = uint8_t(h0 >> 16); s[3] = uint8_t((h0 >> 24) | (h1 << 2));
+    s[4] = uint8_t(h1 >> 6); s[5] = uint8_t(h1 >> 14); s[6] = uint8_t((h1 >> 22) | (h2 << 3)); s[7] = uint8_t(h2 >> 5);
+    s[8] = uint8_t(h2 >> 13); s[9] = uint8_t((h2 >> 21) | (h3 << 5)); s[10] = uint8_t(h3 >> 3); s[11] = uint8_t(h3 >> 11);
+    s[12] = uint8_t((h3 >> 19) | (h4 << 6)); s[13] = uint8_t(h4 >> 2); s[14] = uint8_t(h4 >> 10); s[15] = uint8_t(h4 >> 18);
+    s[16] = uint8_t(h5 >> 0); s[17] = uint8_t(h5 >> 8); s[18] = uint8_t(h5 >> 16); s[19] = uint8_t((h5 >> 24) | (h6 << 2));
+    s[20] = uint8_t(h6 >> 6); s[21] = uint8_t(h6 >> 14); s[22] = uint8_t((h6 >> 22) | (h7 << 3)); s[23] = uint8_t(h7 >> 5);
+    s[24] = uint8_t(h7 >> 13); s[25] = uint8_t((h7 >> 21) | (h8 << 5)); s[26] = uint8_t(h8 >> 3); s[27] = uint8_t(h8 >> 11);
+    s[28] = uint8_t((h8 >> 19) | (h9 << 6)); s[29] = uint8_t(h9 >> 2); s[30] = uint8_t(h9 >> 10); s[31] = uint8_t(h9 >> 18);
+}
+
+void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10]) {
+    int recip[10];
+    fe_invert(recip, Z);
+    int x[10], y[10];
+    fe_mul(x, X, recip);
+    fe_mul(y, Y, recip);
+    fe_tobytes(s, y);
+
+    // sign bit
+    int x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3], x4 = x[4];
+    int x5 = x[5], x6 = x[6], x7 = x[7], x8 = x[8], x9 = x[9];
+    int carry0 = (x0 + (1 << 25)) >> 26; x1 += carry0; x0 -= carry0 << 26;
+    int carry1 = (x1 + (1 << 24)) >> 25; x2 += carry1; x1 -= carry1 << 25;
+    int carry2 = (x2 + (1 << 25)) >> 26; x3 += carry2; x2 -= carry2 << 26;
+    int carry3 = (x3 + (1 << 24)) >> 25; x4 += carry3; x3 -= carry3 << 25;
+    int carry4 = (x4 + (1 << 25)) >> 26; x5 += carry4; x4 -= carry4 << 26;
+    int carry5 = (x5 + (1 << 24)) >> 25; x6 += carry5; x5 -= carry5 << 25;
+    int carry6 = (x6 + (1 << 25)) >> 26; x7 += carry6; x6 -= carry6 << 26;
+    int carry7 = (x7 + (1 << 24)) >> 25; x8 += carry7; x7 -= carry7 << 25;
+    int carry8 = (x8 + (1 << 25)) >> 26; x9 += carry8; x8 -= carry8 << 26;
+    int carry9 = (x9 + (1 << 24)) >> 25; x0 += carry9 * 19; x9 -= carry9 << 25;
+    carry0 = (x0 + (1 << 25)) >> 26; x1 += carry0; x0 -= carry0 << 26;
+
+    int q0 = x0 + 19;
+    int q1 = x1 + (q0 >> 26); q0 &= 0x3ffffff;
+    int q2 = x2 + (q1 >> 25); q1 &= 0x1ffffff;
+    int q3 = x3 + (q2 >> 26); q2 &= 0x3ffffff;
+    int q4 = x4 + (q3 >> 25); q3 &= 0x1ffffff;
+    int q5 = x5 + (q4 >> 26); q4 &= 0x3ffffff;
+    int q6 = x6 + (q5 >> 25); q5 &= 0x1ffffff;
+    int q7 = x7 + (q6 >> 26); q6 &= 0x3ffffff;
+    int q8 = x8 + (q7 >> 25); q7 &= 0x1ffffff;
+    int q9 = x9 + (q8 >> 26); q8 &= 0x3ffffff;
+    q9 = (q9 >> 25) & 1;
+    x0 += 19 * q9;
+    x1 += x0 >> 26; x0 &= 0x3ffffff;
+
+    s[31] ^= uint8_t((x0 & 1) << 7);
+}
+
+void pubkey_to_base32_prefix(in uint8_t pubkey[32], out uint8_t out_prefix[16], uint len) {
     uint64_t state[25];
     for (int i=0; i<25; i++) state[i] = 0ul;
 
-    // Fill the first 48 bytes into the 64-bit state array manually.
-    // 15 bytes ".onion checksum"
-    // 32 bytes pubkey
-    // 1 byte version (0x03)
-
-    // state[0]: prefix[0..7]
     state[0] = pack_bytes(onion_prefix[0], onion_prefix[1], onion_prefix[2], onion_prefix[3],
                           onion_prefix[4], onion_prefix[5], onion_prefix[6], onion_prefix[7]);
-    // state[1]: prefix[8..14] + pubkey[0]
     state[1] = pack_bytes(onion_prefix[8], onion_prefix[9], onion_prefix[10], onion_prefix[11],
-                          onion_prefix[12], onion_prefix[13], onion_prefix[14], base_pubkeys[id_offset + 0]);
-    // state[2]: pubkey[1..8]
-    state[2] = pack_bytes(base_pubkeys[id_offset + 1], base_pubkeys[id_offset + 2], base_pubkeys[id_offset + 3], base_pubkeys[id_offset + 4],
-                          base_pubkeys[id_offset + 5], base_pubkeys[id_offset + 6], base_pubkeys[id_offset + 7], base_pubkeys[id_offset + 8]);
-    // state[3]: pubkey[9..16]
-    state[3] = pack_bytes(base_pubkeys[id_offset + 9], base_pubkeys[id_offset + 10], base_pubkeys[id_offset + 11], base_pubkeys[id_offset + 12],
-                          base_pubkeys[id_offset + 13], base_pubkeys[id_offset + 14], base_pubkeys[id_offset + 15], base_pubkeys[id_offset + 16]);
-    // state[4]: pubkey[17..24]
-    state[4] = pack_bytes(base_pubkeys[id_offset + 17], base_pubkeys[id_offset + 18], base_pubkeys[id_offset + 19], base_pubkeys[id_offset + 20],
-                          base_pubkeys[id_offset + 21], base_pubkeys[id_offset + 22], base_pubkeys[id_offset + 23], base_pubkeys[id_offset + 24]);
-    // state[5]: pubkey[25..31] + version
-    state[5] = pack_bytes(base_pubkeys[id_offset + 25], base_pubkeys[id_offset + 26], base_pubkeys[id_offset + 27], base_pubkeys[id_offset + 28],
-                          base_pubkeys[id_offset + 29], base_pubkeys[id_offset + 30], base_pubkeys[id_offset + 31], uint8_t(0x03));
+                          onion_prefix[12], onion_prefix[13], onion_prefix[14], pubkey[0]);
+    state[2] = pack_bytes(pubkey[1], pubkey[2], pubkey[3], pubkey[4], pubkey[5], pubkey[6], pubkey[7], pubkey[8]);
+    state[3] = pack_bytes(pubkey[9], pubkey[10], pubkey[11], pubkey[12], pubkey[13], pubkey[14], pubkey[15], pubkey[16]);
+    state[4] = pack_bytes(pubkey[17], pubkey[18], pubkey[19], pubkey[20], pubkey[21], pubkey[22], pubkey[23], pubkey[24]);
+    state[5] = pack_bytes(pubkey[25], pubkey[26], pubkey[27], pubkey[28], pubkey[29], pubkey[30], pubkey[31], uint8_t(0x03));
 
-    // Padding
-    // state[6]: byte 48 = 0x06
     state[6] = pack_bytes(uint8_t(0x06), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0));
-    // state[16]: byte 135 = 0x80 (135/8 = 16.875 -> state[16] byte 7)
     state[16] = uint64_t(0x80) << 56;
 
     keccakf(state);
 
-    // Checksum is the first 2 bytes of state[0]
     uint8_t chk0 = uint8_t(state[0] & 0xFFul);
     uint8_t chk1 = uint8_t((state[0] >> 8) & 0xFFul);
 
-    // Build full data: 32 byte pubkey + 2 byte checksum + 1 byte version = 35 bytes
     uint8_t full_data[35];
-    for (int i=0; i<32; i++) full_data[i] = base_pubkeys[id_offset + i];
+    for (int i=0; i<32; i++) full_data[i] = pubkey[i];
     full_data[32] = chk0;
     full_data[33] = chk1;
     full_data[34] = uint8_t(0x03);
@@ -185,10 +436,17 @@ void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= pc.batch_size) return;
 
-    uint id_offset = id * 32u;
+    // Add offset[id] to base_point
+    int R_X[10], R_Y[10], R_Z[10], R_T[10];
+    ge_madd(R_X, R_Y, R_Z, R_T,
+            base_point.X, base_point.Y, base_point.Z, base_point.T,
+            offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+
+    uint8_t final_pubkey[32];
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z);
 
     uint8_t generated_prefix[16];
-    pubkey_to_base32_prefix(id_offset, generated_prefix, pc.prefix_len);
+    pubkey_to_base32_prefix(final_pubkey, generated_prefix, pc.prefix_len);
 
     bool match = true;
     for (uint i = 0; i < pc.prefix_len; ++i) {
