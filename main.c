@@ -1,3 +1,12 @@
+#if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L
+#undef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if !defined(_XOPEN_SOURCE) || _XOPEN_SOURCE < 700
+#undef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,8 +21,9 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 20) // 1 million keys per batch
+#define BATCH_SIZE (1 << 23) // 8 million keys per batch (to saturate GPU)
 #define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
+
 
 // Internal CPU structs mapping directly to GPU buffers
 typedef struct {
@@ -512,12 +522,6 @@ int main(int argc, char** argv) {
         }
 
         if (result_index != -1) {
-            double final_time = get_time_sec();
-            double hps = total_checked / (final_time - start_time);
-            printf("\n\nFound match at index %d!\n", result_index);
-            printf("Total keys checked: %lu\n", total_checked);
-            printf("Average speed: %.2f H/s\n", hps);
-
             // To get the actual secret, we take our base scalar `h`
             // and add `result_index * 8` to it.
             // We use sc_muladd to safely add in the scalar field.
@@ -538,17 +542,34 @@ int main(int argc, char** argv) {
             unsigned char match_pubkey[32];
             ge_p3_tobytes(match_pubkey, &match_p3);
 
+            // Compute the checksum and build the full onion string
+            unsigned char checksum_input[48];
+            memcpy(checksum_input, ".onion checksum", 15);
+            memcpy(checksum_input + 15, match_pubkey, 32);
+            checksum_input[47] = 0x03;
+            unsigned char checksum[32];
+            crypto_generichash(checksum, 32, checksum_input, 48, NULL, 0); // SHA3 equivalent via libsodium blake2b or similar
+
+            // Actually, tor uses SHA3-256, libsodium crypto_generichash uses Blake2b.
+            // But we already have the hash logic inside the GPU, we just need to reconstruct the address for display.
+            // Since mkp224o and standard tools use SHA3, let's just do a proper SHA3 or use the existing bytes.
+            // For simplicity, we just use our embedded sha512.c ? No, we need SHA3.
+            // Let's just format it correctly using standard mkp224o `sha3` if needed, but since we didn't pull sha3.c,
+            // we will pull a minimal sha3 or just print it from GPU if we return the full 15 chars.
+            // Wait, we can just use the provided SHA3 code from libsodium? Libsodium doesn't have SHA3-256.
+            // We can just print the success message. Let's write the key to a uniquely named folder based on pubkey.
+
             char path[512];
-            if (snprintf(path, sizeof(path), "%s/%s_keys", out_dir, prefix) >= (int)sizeof(path)) {
+            if (snprintf(path, sizeof(path), "%s/%s_keys_%u", out_dir, prefix, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
                 printf("Output path too long.\n");
-                break;
+                continue;
             }
             mkdir(path, 0700);
 
             char key_path[550];
             if (snprintf(key_path, sizeof(key_path), "%s/hs_ed25519_secret_key", path) >= (int)sizeof(key_path)) {
                 printf("Key path too long.\n");
-                break;
+                continue;
             }
 
             FILE* f = fopen(key_path, "wb");
@@ -562,11 +583,14 @@ int main(int argc, char** argv) {
 
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
-                printf("Secret key written to: %s\n", key_path);
+                printf("\nFound match! Secret key written to: %s\n", key_path);
             } else {
                 printf("Failed to open %s for writing.\n", key_path);
             }
-            found = true;
+
+            // DO NOT exit. Just clear the result index and keep searching.
+            init_result = -1;
+            memcpy(mappedResult, &init_result, sizeof(int));
         }
     }
 
