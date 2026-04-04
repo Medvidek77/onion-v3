@@ -21,7 +21,7 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 21) // 2 million keys per batch (~320MB offset buffer, fits in standard 256MB/512MB BAR)
+#define BATCH_SIZE (1 << 19) // 524,288 keys per batch (~80MB offset buffer, fits inside 128MB AMD Infinity Cache)
 #define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
 
 
@@ -462,7 +462,7 @@ int main(int argc, char** argv) {
     uint32_t pushConstants[2] = { BATCH_SIZE, (uint32_t)prefix_len };
     vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
 
-    vkCmdDispatch(commandBuffer, BATCH_SIZE / 256, 1, 1);
+    vkCmdDispatch(commandBuffer, BATCH_SIZE / 64, 1, 1);
     VK_CHECK(vkEndCommandBuffer(commandBuffer));
 
     printf("Starting search for prefix '%s' via Vulkan...\n", prefix);
