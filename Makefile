@@ -1,6 +1,6 @@
 CC ?= gcc
-CFLAGS = -Wall -Wextra -O3 -std=c99
-LDFLAGS = -lOpenCL -lsodium
+CFLAGS = -Wall -Wextra -O3 -std=c99 -I/usr/local/include
+LDFLAGS = -L/usr/local/lib -lOpenCL -lsodium
 
 TARGET = tor_vanity_ocl
 SRCS = main.c
