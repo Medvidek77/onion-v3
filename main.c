@@ -632,9 +632,7 @@ int main(int argc, char** argv) {
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
 
-                if (print_stats) {
-                    printf("\r\033[2K%s\n", path);
-                } else {
+                if (!print_stats) {
                     printf("%s\n", path);
                     fflush(stdout);
                 }
