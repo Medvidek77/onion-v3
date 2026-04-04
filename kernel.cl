@@ -82,7 +82,6 @@ inline void keccakf(uint64_t st[25]) {
 // Convert 32-byte public key to first few chars of base32
 inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len) {
     uint8_t state[25 * 8] = {0};
-    uint64_t* st = (uint64_t*)state;
 
     // TOR v3 onion address format:
     // checksum = sha3_256(".onion checksum" || pubkey || version)
@@ -90,7 +89,7 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
 
     // Construct the input for sha3_256
     // ".onion checksum" (15 bytes)
-    const char* prefix = ".onion checksum";
+    __constant char prefix[] = ".onion checksum";
     for(int i=0; i<15; ++i) state[i] = prefix[i];
     // pubkey (32 bytes)
     for(int i=0; i<32; ++i) state[15+i] = pubkey[i];
@@ -103,7 +102,7 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
 
     // Endianness adjustment before keccakf
     // OpenCL usually uses little endian, which is correct for Keccak.
-    keccakf(st);
+    keccakf((uint64_t*)state);
 
     // The checksum is the first 2 bytes of the state.
     uint8_t checksum[2];
@@ -118,7 +117,7 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
     full_data[33] = checksum[1];
     full_data[34] = 0x03;
 
-    const char* alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    __constant char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
 
     int bit_offset = 0;
     for(int i=0; i<len; ++i) {
