@@ -493,9 +493,10 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[0]));
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
 
-    printf("Starting search for prefix '%s' via Vulkan...\n", prefix);
+    printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
 
     uint64_t total_checked = 0;
+    uint32_t found_count = 0;
     bool found = false;
 
     void* mappedBasepoint[2];
@@ -558,12 +559,13 @@ int main(int argc, char** argv) {
         double current_time = get_time_sec();
         if (current_time - last_print_time >= 1.0) {
             double hps = total_checked / (current_time - start_time);
-            printf("\rChecked %lu keys... %.2f H/s", total_checked, hps);
+            printf("\033[A\r\033[2KChecked %lu keys | %.2f H/s | Found: %u\n", total_checked, hps, found_count);
             fflush(stdout);
             last_print_time = current_time;
         }
 
         if (result_index != -1) {
+            found_count++;
             unsigned char* h = h_scalars[cur_frame];
             // To get the actual secret, we take our base scalar `h`
             // and add `result_index * 8` to it.
@@ -618,7 +620,7 @@ int main(int argc, char** argv) {
                 memcpy(expanded_sk + 32, match_pubkey, 32);
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
-                printf("\n%s\n", path); // Print only the folder path like mkp224o's quiet mode
+                printf("\033[A\r\033[2K%s\n\n", path); // Overwrite counter, print path, push counter down
             }
 
             // DO NOT exit. Just clear the result index and keep searching.
