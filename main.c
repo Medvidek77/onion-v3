@@ -15,13 +15,26 @@ char* load_kernel_source(const char* filename, size_t* size_ret) {
     FILE* f = fopen(filename, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
     fseek(f, 0, SEEK_SET);
-    char* source = malloc(size + 1);
-    fread(source, 1, size, f);
+    char* source = malloc((size_t)size + 1);
+    if (!source) {
+        fclose(f);
+        return NULL;
+    }
+    size_t read_bytes = fread(source, 1, (size_t)size, f);
+    if (read_bytes != (size_t)size) {
+        free(source);
+        fclose(f);
+        return NULL;
+    }
     source[size] = '\0';
     fclose(f);
-    if (size_ret) *size_ret = size;
+    if (size_ret) *size_ret = (size_t)size;
     return source;
 }
 
@@ -99,21 +112,58 @@ int main(int argc, char** argv) {
     clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
     if (log_size > 1) {
         char* log = malloc(log_size);
-        clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
-        printf("Build log:\n%s\n", log);
-        free(log);
+        if (log) {
+            clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
+            printf("Build log:\n%s\n", log);
+            free(log);
+        }
     }
 
-    cl_kernel kernel = clCreateKernel(prog, "vanity_search", NULL);
+    cl_kernel kernel = clCreateKernel(prog, "vanity_search", &err);
+    if (err != CL_SUCCESS || !kernel) {
+        printf("Failed to create kernel (err %d).\n", err);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(source);
+        return 1;
+    }
 
     // Setup buffers
     size_t pubkeys_size = BATCH_SIZE * 32;
     uint8_t* host_pubkeys = malloc(pubkeys_size);
     uint8_t* host_secrets = malloc(pubkeys_size); // to keep track of secrets
 
-    cl_mem d_pubkeys = clCreateBuffer(ctx, CL_MEM_READ_ONLY, pubkeys_size, NULL, NULL);
-    cl_mem d_prefix = clCreateBuffer(ctx, CL_MEM_READ_ONLY, prefix_len, NULL, NULL);
-    cl_mem d_result = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int), NULL, NULL);
+    if (!host_pubkeys || !host_secrets) {
+        printf("Failed to allocate host memory.\n");
+        if (host_pubkeys) free(host_pubkeys);
+        if (host_secrets) free(host_secrets);
+        clReleaseKernel(kernel);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(source);
+        return 1;
+    }
+
+    cl_mem d_pubkeys = clCreateBuffer(ctx, CL_MEM_READ_ONLY, pubkeys_size, NULL, &err);
+    cl_mem d_prefix = clCreateBuffer(ctx, CL_MEM_READ_ONLY, prefix_len, NULL, &err);
+    cl_mem d_result = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int), NULL, &err);
+
+    if (!d_pubkeys || !d_prefix || !d_result) {
+        printf("Failed to allocate device memory.\n");
+        if (d_pubkeys) clReleaseMemObject(d_pubkeys);
+        if (d_prefix) clReleaseMemObject(d_prefix);
+        if (d_result) clReleaseMemObject(d_result);
+        free(host_pubkeys);
+        free(host_secrets);
+        clReleaseKernel(kernel);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(source);
+        return 1;
+    }
 
     clEnqueueWriteBuffer(queue, d_prefix, CL_TRUE, 0, prefix_len, prefix, 0, NULL, NULL);
 
@@ -161,11 +211,17 @@ int main(int argc, char** argv) {
 
             // Create tor hs directory structure
             char path[512];
-            snprintf(path, sizeof(path), "%s/%s_keys", out_dir, prefix);
+            if (snprintf(path, sizeof(path), "%s/%s_keys", out_dir, prefix) >= (int)sizeof(path)) {
+                printf("Output path too long.\n");
+                break;
+            }
             mkdir(path, 0700);
 
-            char key_path[512];
-            snprintf(key_path, sizeof(key_path), "%s/hs_ed25519_secret_key", path);
+            char key_path[550]; // Ensuring enough space for path + filename
+            if (snprintf(key_path, sizeof(key_path), "%s/hs_ed25519_secret_key", path) >= (int)sizeof(key_path)) {
+                printf("Key path too long.\n");
+                break;
+            }
 
             FILE* f = fopen(key_path, "wb");
             if (f) {
