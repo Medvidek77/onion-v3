@@ -1,13 +1,17 @@
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 #include <sodium.h>
 
 #define BATCH_SIZE (1 << 20) // 1 million keys per batch
+#define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
 
 #ifdef DEBUG
     #define DEBUG_PRINT(...) printf("[DEBUG] " __VA_ARGS__)
@@ -43,6 +47,28 @@ void get_pubkey(const unsigned char *sk, unsigned char *pk) {
     h[31] &= 127;
     h[31] |= 64;
     crypto_scalarmult_ed25519_base_noclamp(pk, h);
+}
+
+typedef struct {
+    uint8_t* host_secrets;
+    uint8_t* host_pubkeys;
+    int start_index;
+    int end_index;
+} ThreadData;
+
+void* generate_keys_worker(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    for (int i = data->start_index; i < data->end_index; ++i) {
+        randombytes_buf(&data->host_secrets[i * 32], 32);
+        get_pubkey(&data->host_secrets[i * 32], &data->host_pubkeys[i * 32]);
+    }
+    return NULL;
+}
+
+double get_time_sec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1000000000.0;
 }
 
 int main(int argc, char** argv) {
@@ -366,11 +392,26 @@ int main(int argc, char** argv) {
     void* mappedResult;
     vkMapMemory(device, resultMemory, 0, result_size, 0, &mappedResult);
 
+    pthread_t threads[NUM_THREADS];
+    ThreadData tdata[NUM_THREADS];
+    int batch_per_thread = BATCH_SIZE / NUM_THREADS;
+
+    double start_time = get_time_sec();
+    double last_print_time = start_time;
+
     while (!found) {
-        for (int i = 0; i < BATCH_SIZE; ++i) {
-            randombytes_buf(&host_secrets[i * 32], 32);
-            get_pubkey(&host_secrets[i * 32], &host_pubkeys[i * 32]);
+        // Parallel key generation
+        for (int i = 0; i < NUM_THREADS; ++i) {
+            tdata[i].host_secrets = host_secrets;
+            tdata[i].host_pubkeys = host_pubkeys;
+            tdata[i].start_index = i * batch_per_thread;
+            tdata[i].end_index = (i == NUM_THREADS - 1) ? BATCH_SIZE : (i + 1) * batch_per_thread;
+            pthread_create(&threads[i], NULL, generate_keys_worker, &tdata[i]);
         }
+        for (int i = 0; i < NUM_THREADS; ++i) {
+            pthread_join(threads[i], NULL);
+        }
+
         memcpy(mappedPubkeys, host_pubkeys, pubkeys_size);
 
         int init_result = -1;
@@ -388,13 +429,21 @@ int main(int argc, char** argv) {
         memcpy(&result_index, mappedResult, sizeof(int));
 
         total_checked += BATCH_SIZE;
-        if (total_checked % (BATCH_SIZE * 10) == 0) {
-            printf("Checked %lu keys...\n", total_checked);
+
+        double current_time = get_time_sec();
+        if (current_time - last_print_time >= 1.0) {
+            double hps = total_checked / (current_time - start_time);
+            printf("\rChecked %lu keys... %.2f H/s", total_checked, hps);
+            fflush(stdout);
+            last_print_time = current_time;
         }
 
         if (result_index != -1) {
-            printf("\nFound match at index %d!\n", result_index);
+            double final_time = get_time_sec();
+            double hps = total_checked / (final_time - start_time);
+            printf("\n\nFound match at index %d!\n", result_index);
             printf("Total keys checked: %lu\n", total_checked);
+            printf("Average speed: %.2f H/s\n", hps);
 
             unsigned char* secret = &host_secrets[result_index * 32];
 
