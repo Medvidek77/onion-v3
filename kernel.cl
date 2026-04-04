@@ -157,6 +157,6 @@ __kernel void vanity_search(
     }
 
     if (match) {
-        atomic_xchg(result_index, id);
+        atomic_cmpxchg(result_index, -1, id);
     }
 }

@@ -71,23 +71,45 @@ int main(int argc, char** argv) {
 
     mkdir(out_dir, 0700);
 
-    // Initialize OpenCL
-    cl_platform_id platform = NULL;
-    cl_int err = clGetPlatformIDs(1, &platform, NULL);
-    if (err != CL_SUCCESS || !platform) {
-        printf("Failed to find OpenCL platform (err %d). Running in sandbox might not have OpenCL available.\n", err);
-        return 0; // Graceful exit in sandbox environment
+    // Initialize OpenCL: iterate over all platforms to find a GPU, fallback to CPU
+    cl_uint num_platforms = 0;
+    cl_int err = clGetPlatformIDs(0, NULL, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
+        printf("Failed to find OpenCL platforms (err %d). Running in sandbox might not have OpenCL available.\n", err);
+        return 0; // Graceful exit
     }
 
+    cl_platform_id* platforms = malloc(sizeof(cl_platform_id) * num_platforms);
+    clGetPlatformIDs(num_platforms, platforms, NULL);
+
+    cl_platform_id platform = NULL;
     cl_device_id device = NULL;
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-    if (err != CL_SUCCESS || !device) {
-        // Fallback to CPU if GPU not available
-        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
-        if (err != CL_SUCCESS || !device) {
-            printf("Failed to find OpenCL GPU/CPU device (err %d).\n", err);
-            return 0; // Graceful exit
+
+    // First pass: try to find a GPU
+    for (cl_uint i = 0; i < num_platforms; ++i) {
+        err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
+        if (err == CL_SUCCESS && device) {
+            platform = platforms[i];
+            break;
         }
+    }
+
+    // Second pass: fallback to CPU
+    if (!device) {
+        for (cl_uint i = 0; i < num_platforms; ++i) {
+            err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_CPU, 1, &device, NULL);
+            if (err == CL_SUCCESS && device) {
+                platform = platforms[i];
+                break;
+            }
+        }
+    }
+
+    free(platforms);
+
+    if (!device || !platform) {
+        printf("Failed to find OpenCL GPU/CPU device.\n");
+        return 0;
     }
 
     char device_name[128];
@@ -216,7 +238,14 @@ int main(int argc, char** argv) {
         }
 
         size_t global_work_size = BATCH_SIZE;
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+        size_t local_work_size = 256; // Standard sensible local size
+
+        // Ensure global size is a multiple of local size
+        if (global_work_size % local_work_size != 0) {
+            global_work_size = (global_work_size / local_work_size + 1) * local_work_size;
+        }
+
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, &local_work_size, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             printf("Failed to enqueue NDRangeKernel: err %d\n", err);
             break;
