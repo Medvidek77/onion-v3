@@ -1,10 +1,7 @@
 CC ?= gcc
-CFLAGS = -Wall -Wextra -O3 -std=c99 -I/usr/local/include
+DEBUG_FLAGS ?=
+CFLAGS = -Wall -Wextra -O3 -std=c99 -I/usr/local/include $(DEBUG_FLAGS)
 LDFLAGS = -L/usr/local/lib -lvulkan -lsodium
-
-ifeq ($(DEBUG), 1)
-    CFLAGS += -DDEBUG -g -O0
-endif
 GLSLC ?= glslc
 
 TARGET = tor_vanity_vk
