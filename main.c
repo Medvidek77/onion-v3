@@ -141,13 +141,22 @@ double get_time_sec() {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        printf("Usage: %s <prefix> <output_dir>\n", argv[0]);
+    bool print_stats = false;
+    int arg_idx = 1;
+
+    if (argc > 1 && strcmp(argv[1], "-s") == 0) {
+        print_stats = true;
+        arg_idx = 2;
+    }
+
+    if (argc - arg_idx < 2) {
+        printf("Usage: %s [-s] <prefix> <output_dir>\n", argv[0]);
+        printf("  -s : Show hashing statistics (H/s)\n");
         return 1;
     }
 
-    const char* prefix = argv[1];
-    const char* out_dir = argv[2];
+    const char* prefix = argv[arg_idx];
+    const char* out_dir = argv[arg_idx + 1];
     size_t prefix_len = strlen(prefix);
 
     if (prefix_len > 16) {
@@ -493,7 +502,9 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[0]));
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
 
-    printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
+    if (print_stats) {
+        printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
+    }
 
     uint64_t total_checked = 0;
     uint32_t found_count = 0;
@@ -557,9 +568,9 @@ int main(int argc, char** argv) {
         total_checked += BATCH_SIZE;
 
         double current_time = get_time_sec();
-        if (current_time - last_print_time >= 1.0) {
+        if (print_stats && current_time - last_print_time >= 1.0) {
             double hps = total_checked / (current_time - start_time);
-            printf("\033[A\r\033[2KChecked %lu keys | %.2f H/s | Found: %u\n", total_checked, hps, found_count);
+            printf("\rChecked %lu keys | %.2f H/s | Found: %u    ", total_checked, hps, found_count);
             fflush(stdout);
             last_print_time = current_time;
         }
@@ -620,7 +631,13 @@ int main(int argc, char** argv) {
                 memcpy(expanded_sk + 32, match_pubkey, 32);
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
-                printf("\033[A\r\033[2K%s\n\n", path); // Overwrite counter, print path, push counter down
+
+                if (print_stats) {
+                    printf("\r\033[2K%s\n", path);
+                } else {
+                    printf("%s\n", path);
+                    fflush(stdout);
+                }
             }
 
             // DO NOT exit. Just clear the result index and keep searching.
