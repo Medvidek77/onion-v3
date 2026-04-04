@@ -9,6 +9,12 @@
 
 #define BATCH_SIZE (1 << 20) // 1 million keys per batch
 
+#ifdef DEBUG
+    #define DEBUG_PRINT(...) printf("[DEBUG] " __VA_ARGS__)
+#else
+    #define DEBUG_PRINT(...) do {} while (0)
+#endif
+
 #define VK_CHECK(x) \
     do { \
         VkResult err = x; \
@@ -83,6 +89,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to create Vulkan instance.\n");
         return 1;
     }
+    DEBUG_PRINT("Vulkan instance created successfully.\n");
 
     uint32_t deviceCount = 0;
     vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
@@ -90,11 +97,23 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to find GPUs with Vulkan support.\n");
         return 1;
     }
+    DEBUG_PRINT("Found %d physical device(s).\n", deviceCount);
+
     VkPhysicalDevice* physicalDevices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
     vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices);
 
-    // Just pick the first device for simplicity (usually the discrete GPU on a standard setup)
+    // Attempt to prefer Discrete GPUs, fallback to first available
     VkPhysicalDevice physicalDevice = physicalDevices[0];
+    for (uint32_t i = 0; i < deviceCount; i++) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevices[i], &props);
+        DEBUG_PRINT("Device %d: %s (Type: %d)\n", i, props.deviceName, props.deviceType);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            physicalDevice = physicalDevices[i];
+            break;
+        }
+    }
+
     VkPhysicalDeviceProperties deviceProperties;
     vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
     printf("Using Vulkan Device: %s\n", deviceProperties.deviceName);
@@ -107,6 +126,7 @@ int main(int argc, char** argv) {
 
     uint32_t computeFamily = -1;
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        DEBUG_PRINT("Queue Family %d: flags 0x%08X, count %d\n", i, queueFamilies[i].queueFlags, queueFamilies[i].queueCount);
         if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             computeFamily = i;
             break;
@@ -117,6 +137,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to find compute queue family.\n");
         return 1;
     }
+    DEBUG_PRINT("Selected Compute Queue Family Index: %d\n", computeFamily);
 
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCreateInfo = {
