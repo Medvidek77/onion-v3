@@ -6,9 +6,6 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-shared int shared_z[64][10];
-shared int shared_prods[64][10];
-
 struct ge_p3 {
     int X[10];
     int Y[10];
@@ -51,96 +48,12 @@ layout(push_constant) uniform PushConstants {
     uint prefix_len;
 } pc;
 
-const uint64_t keccakf_rndc[24] = uint64_t[24](
-    0x0000000000000001ul, 0x0000000000008082ul, 0x800000000000808aul,
-    0x8000000080008000ul, 0x000000000000808bul, 0x0000000080000001ul,
-    0x8000000080008081ul, 0x8000000000008009ul, 0x000000000000008aul,
-    0x0000000000000088ul, 0x0000000080008009ul, 0x000000008000000aul,
-    0x000000008000808bul, 0x800000000000008bul, 0x8000000000008089ul,
-    0x8000000000008003ul, 0x8000000000008002ul, 0x8000000000000080ul,
-    0x000000000000800aul, 0x800000008000000aul, 0x8000000080008081ul,
-    0x8000000000008080ul, 0x0000000080000001ul, 0x8000000080008008ul
-);
-
-uint64_t ROL64(uint64_t a, uint offset) {
-    if (offset == 0) return a;
-    return (a << offset) ^ (a >> (64u - offset));
-}
-
-#define KECCAK_ROUND(r) \
-    bc[0] = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20]; \
-    bc[1] = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21]; \
-    bc[2] = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22]; \
-    bc[3] = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23]; \
-    bc[4] = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24]; \
-    t = bc[4] ^ ROL64(bc[1], 1); st[0] ^= t; st[5] ^= t; st[10] ^= t; st[15] ^= t; st[20] ^= t; \
-    t = bc[0] ^ ROL64(bc[2], 1); st[1] ^= t; st[6] ^= t; st[11] ^= t; st[16] ^= t; st[21] ^= t; \
-    t = bc[1] ^ ROL64(bc[3], 1); st[2] ^= t; st[7] ^= t; st[12] ^= t; st[17] ^= t; st[22] ^= t; \
-    t = bc[2] ^ ROL64(bc[4], 1); st[3] ^= t; st[8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t; \
-    t = bc[3] ^ ROL64(bc[0], 1); st[4] ^= t; st[9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t; \
-    t = st[1]; \
-    bc[0] = st[10]; st[10] = ROL64(t, 1); t = bc[0]; \
-    bc[0] = st[7]; st[7] = ROL64(t, 3); t = bc[0]; \
-    bc[0] = st[11]; st[11] = ROL64(t, 6); t = bc[0]; \
-    bc[0] = st[17]; st[17] = ROL64(t, 10); t = bc[0]; \
-    bc[0] = st[18]; st[18] = ROL64(t, 15); t = bc[0]; \
-    bc[0] = st[3]; st[3] = ROL64(t, 21); t = bc[0]; \
-    bc[0] = st[5]; st[5] = ROL64(t, 28); t = bc[0]; \
-    bc[0] = st[16]; st[16] = ROL64(t, 36); t = bc[0]; \
-    bc[0] = st[8]; st[8] = ROL64(t, 45); t = bc[0]; \
-    bc[0] = st[21]; st[21] = ROL64(t, 55); t = bc[0]; \
-    bc[0] = st[24]; st[24] = ROL64(t, 2); t = bc[0]; \
-    bc[0] = st[4]; st[4] = ROL64(t, 14); t = bc[0]; \
-    bc[0] = st[15]; st[15] = ROL64(t, 27); t = bc[0]; \
-    bc[0] = st[23]; st[23] = ROL64(t, 41); t = bc[0]; \
-    bc[0] = st[19]; st[19] = ROL64(t, 56); t = bc[0]; \
-    bc[0] = st[13]; st[13] = ROL64(t, 8); t = bc[0]; \
-    bc[0] = st[12]; st[12] = ROL64(t, 25); t = bc[0]; \
-    bc[0] = st[2]; st[2] = ROL64(t, 43); t = bc[0]; \
-    bc[0] = st[20]; st[20] = ROL64(t, 62); t = bc[0]; \
-    bc[0] = st[14]; st[14] = ROL64(t, 18); t = bc[0]; \
-    bc[0] = st[22]; st[22] = ROL64(t, 39); t = bc[0]; \
-    bc[0] = st[9]; st[9] = ROL64(t, 61); t = bc[0]; \
-    bc[0] = st[6]; st[6] = ROL64(t, 20); t = bc[0]; \
-    st[1] = ROL64(t, 44); \
-    bc[0] = st[0]; bc[1] = st[1]; bc[2] = st[2]; bc[3] = st[3]; bc[4] = st[4]; \
-    st[0] = bc[0] ^ (~bc[1] & bc[2]); st[1] = bc[1] ^ (~bc[2] & bc[3]); st[2] = bc[2] ^ (~bc[3] & bc[4]); st[3] = bc[3] ^ (~bc[4] & bc[0]); st[4] = bc[4] ^ (~bc[0] & bc[1]); \
-    bc[0] = st[5]; bc[1] = st[6]; bc[2] = st[7]; bc[3] = st[8]; bc[4] = st[9]; \
-    st[5] = bc[0] ^ (~bc[1] & bc[2]); st[6] = bc[1] ^ (~bc[2] & bc[3]); st[7] = bc[2] ^ (~bc[3] & bc[4]); st[8] = bc[3] ^ (~bc[4] & bc[0]); st[9] = bc[4] ^ (~bc[0] & bc[1]); \
-    bc[0] = st[10]; bc[1] = st[11]; bc[2] = st[12]; bc[3] = st[13]; bc[4] = st[14]; \
-    st[10] = bc[0] ^ (~bc[1] & bc[2]); st[11] = bc[1] ^ (~bc[2] & bc[3]); st[12] = bc[2] ^ (~bc[3] & bc[4]); st[13] = bc[3] ^ (~bc[4] & bc[0]); st[14] = bc[4] ^ (~bc[0] & bc[1]); \
-    bc[0] = st[15]; bc[1] = st[16]; bc[2] = st[17]; bc[3] = st[18]; bc[4] = st[19]; \
-    st[15] = bc[0] ^ (~bc[1] & bc[2]); st[16] = bc[1] ^ (~bc[2] & bc[3]); st[17] = bc[2] ^ (~bc[3] & bc[4]); st[18] = bc[3] ^ (~bc[4] & bc[0]); st[19] = bc[4] ^ (~bc[0] & bc[1]); \
-    bc[0] = st[20]; bc[1] = st[21]; bc[2] = st[22]; bc[3] = st[23]; bc[4] = st[24]; \
-    st[20] = bc[0] ^ (~bc[1] & bc[2]); st[21] = bc[1] ^ (~bc[2] & bc[3]); st[22] = bc[2] ^ (~bc[3] & bc[4]); st[23] = bc[3] ^ (~bc[4] & bc[0]); st[24] = bc[4] ^ (~bc[0] & bc[1]); \
-    st[0] ^= keccakf_rndc[r];
-
-void keccakf(inout uint64_t st[25]) {
-    uint64_t t, bc[5];
-    // Manually unroll by 4 to avoid loop branching overhead without exploding compiler AST like -O did
-    for (int r = 0; r < 24; r += 4) {
-        KECCAK_ROUND(r);
-        KECCAK_ROUND(r + 1);
-        KECCAK_ROUND(r + 2);
-        KECCAK_ROUND(r + 3);
-    }
-}
-
 const uint8_t b32_alphabet[32] = uint8_t[32](
     uint8_t(97), uint8_t(98), uint8_t(99), uint8_t(100), uint8_t(101), uint8_t(102), uint8_t(103), uint8_t(104),
     uint8_t(105), uint8_t(106), uint8_t(107), uint8_t(108), uint8_t(109), uint8_t(110), uint8_t(111), uint8_t(112),
     uint8_t(113), uint8_t(114), uint8_t(115), uint8_t(116), uint8_t(117), uint8_t(118), uint8_t(119), uint8_t(120),
     uint8_t(121), uint8_t(122), uint8_t(50), uint8_t(51), uint8_t(52), uint8_t(53), uint8_t(54), uint8_t(55)
 );
-const uint8_t onion_prefix[15] = uint8_t[15](
-    uint8_t(46), uint8_t(111), uint8_t(110), uint8_t(105), uint8_t(111), uint8_t(110), uint8_t(32),
-    uint8_t(99), uint8_t(104), uint8_t(101), uint8_t(99), uint8_t(107), uint8_t(115), uint8_t(117), uint8_t(109)
-);
-
-uint64_t pack_bytes(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5, uint8_t b6, uint8_t b7) {
-    return uint64_t(b0) | (uint64_t(b1) << 8) | (uint64_t(b2) << 16) | (uint64_t(b3) << 24) |
-           (uint64_t(b4) << 32) | (uint64_t(b5) << 40) | (uint64_t(b6) << 48) | (uint64_t(b7) << 56);
-}
 
 // ==== ED25519 FIELD MATH IN GLSL ====
 void fe_add(out int h[10], in int f[10], in int g[10]) {
@@ -262,15 +175,6 @@ void ge_madd_precomp(out int r_X[10], out int r_Y[10], out int r_Z[10], out int 
     fe_mul(r_T, A, B);
 }
 
-void fe_sq_n(out int h[10], in int f[10], int n) {
-    int temp[10];
-    fe_sq(temp, f);
-    for (int i = 1; i < n; ++i) {
-        fe_sq(temp, temp);
-    }
-    for (int i = 0; i < 10; ++i) h[i] = temp[i];
-}
-
 void fe_invert(out int out_fe[10], in int z[10]) {
     int t0[10], t1[10], t2[10], t3[10];
 
@@ -281,21 +185,33 @@ void fe_invert(out int out_fe[10], in int z[10]) {
     fe_mul(t0, t0, t1);
     fe_sq(t2, t0);
     fe_mul(t1, t1, t2);
-    fe_sq_n(t2, t1, 5);
+
+    fe_sq(t2, t1); fe_sq(t2, t2); fe_sq(t2, t2); fe_sq(t2, t2); fe_sq(t2, t2);
     fe_mul(t1, t2, t1);
-    fe_sq_n(t2, t1, 10);
+
+    fe_sq(t2, t1);
+    for(int i=1;i<10;++i) fe_sq(t2, t2);
     fe_mul(t2, t2, t1);
-    fe_sq_n(t3, t2, 20);
+
+    fe_sq(t3, t2);
+    for(int i=1;i<20;++i) fe_sq(t3, t3);
     fe_mul(t2, t3, t2);
-    fe_sq_n(t2, t2, 10);
+
+    for(int i=0;i<10;++i) fe_sq(t2, t2);
     fe_mul(t1, t2, t1);
-    fe_sq_n(t2, t1, 50);
+
+    fe_sq(t2, t1);
+    for(int i=1;i<50;++i) fe_sq(t2, t2);
     fe_mul(t2, t2, t1);
-    fe_sq_n(t3, t2, 100);
+
+    fe_sq(t3, t2);
+    for(int i=1;i<100;++i) fe_sq(t3, t3);
     fe_mul(t2, t3, t2);
-    fe_sq_n(t2, t2, 50);
+
+    for(int i=0;i<50;++i) fe_sq(t2, t2);
     fe_mul(t1, t2, t1);
-    fe_sq_n(t1, t1, 5);
+
+    fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1);
     fe_mul(out_fe, t1, t0);
 }
 
@@ -358,7 +274,9 @@ void fe_tobytes(out uint8_t s[32], in int h[10]) {
     s[28] = uint8_t((h8 >> 19) | (h9 << 6)); s[29] = uint8_t(h9 >> 2); s[30] = uint8_t(h9 >> 10); s[31] = uint8_t(h9 >> 18);
 }
 
-void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10], in int recip[10]) {
+void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10]) {
+    int recip[10];
+    fe_invert(recip, Z);
     int x[10], y[10];
     fe_mul(x, X, recip);
     fe_mul(y, Y, recip);
@@ -396,48 +314,6 @@ void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10], 
     s[31] ^= uint8_t((x0 & 1) << 7);
 }
 
-void pubkey_to_base32_prefix(in uint8_t pubkey[32], out uint8_t out_prefix[16], uint len) {
-    uint64_t state[25];
-    for (int i=0; i<25; i++) state[i] = 0ul;
-
-    state[0] = pack_bytes(onion_prefix[0], onion_prefix[1], onion_prefix[2], onion_prefix[3],
-                          onion_prefix[4], onion_prefix[5], onion_prefix[6], onion_prefix[7]);
-    state[1] = pack_bytes(onion_prefix[8], onion_prefix[9], onion_prefix[10], onion_prefix[11],
-                          onion_prefix[12], onion_prefix[13], onion_prefix[14], pubkey[0]);
-    state[2] = pack_bytes(pubkey[1], pubkey[2], pubkey[3], pubkey[4], pubkey[5], pubkey[6], pubkey[7], pubkey[8]);
-    state[3] = pack_bytes(pubkey[9], pubkey[10], pubkey[11], pubkey[12], pubkey[13], pubkey[14], pubkey[15], pubkey[16]);
-    state[4] = pack_bytes(pubkey[17], pubkey[18], pubkey[19], pubkey[20], pubkey[21], pubkey[22], pubkey[23], pubkey[24]);
-    state[5] = pack_bytes(pubkey[25], pubkey[26], pubkey[27], pubkey[28], pubkey[29], pubkey[30], pubkey[31], uint8_t(0x03));
-
-    state[6] = pack_bytes(uint8_t(0x06), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0));
-    state[16] = uint64_t(0x80) << 56;
-
-    keccakf(state);
-
-    uint8_t chk0 = uint8_t(state[0] & 0xFFul);
-    uint8_t chk1 = uint8_t((state[0] >> 8) & 0xFFul);
-
-    uint8_t full_data[35];
-    for (int i=0; i<32; i++) full_data[i] = pubkey[i];
-    full_data[32] = chk0;
-    full_data[33] = chk1;
-    full_data[34] = uint8_t(0x03);
-
-    int bit_offset = 0;
-    for(int i=0; i<len; ++i) {
-        int byte_index = bit_offset / 8;
-        int bit_shift = bit_offset % 8;
-
-        uint val = uint(full_data[byte_index]);
-        if (byte_index + 1 < 35) {
-            val |= (uint(full_data[byte_index+1]) << 8);
-        }
-
-        out_prefix[i] = b32_alphabet[(val >> bit_shift) & 31u];
-        bit_offset += 5;
-    }
-}
-
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= pc.batch_size) return;
@@ -448,43 +324,39 @@ void main() {
                     base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
                     offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
-    uint lid = gl_LocalInvocationID.x;
-    for (int i=0; i<10; i++) shared_z[lid][i] = R_Z[i];
-    barrier();
-
-    // Proper Montgomery batch inversion in LDS for 64 threads
-    // Pass 1: Prefix products
-    if (lid == 0) {
-        for (int i=0; i<10; i++) shared_prods[0][i] = shared_z[0][i];
-        for (int i=1; i<64; i++) {
-            fe_mul(shared_prods[i], shared_prods[i-1], shared_z[i]);
-        }
-
-        int inv[10];
-        fe_invert(inv, shared_prods[63]);
-
-        for (int i=63; i>0; i--) {
-            int cur_z[10];
-            for (int j=0; j<10; j++) cur_z[j] = shared_z[i][j];
-            fe_mul(shared_z[i], inv, shared_prods[i-1]);
-            fe_mul(inv, inv, cur_z);
-        }
-        for (int j=0; j<10; j++) shared_z[0][j] = inv[j];
-    }
-    barrier();
-
-    int recip[10];
-    for (int i=0; i<10; i++) recip[i] = shared_z[lid][i];
-
     uint8_t final_pubkey[32];
-    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z, recip);
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z);
 
-    uint8_t generated_prefix[16];
-    pubkey_to_base32_prefix(final_pubkey, generated_prefix, pc.prefix_len);
+    // FAST PATH: Check the public key directly against the target prefix WITHOUT Keccak
+    // Since base32 uses 5 bits per character, 16 characters = 80 bits = 10 bytes.
+    // The Tor v3 format hashes `.onion checksum || pubkey || 0x03`. But the .onion string
+    // starts directly with `base32(pubkey)`. So if prefix_len <= 16, we only check `pubkey`!
+
+    uint8_t fast_prefix[16];
+    int bit_offset = 0;
+    for (int i = 0; i < int(pc.prefix_len); ++i) {
+        int bidx  = bit_offset / 8;
+        int bsft  = bit_offset % 8;
+
+        // Tor uses RFC 4648 Base32 which extracts bits MSB-first (left-to-right).
+        // For a 5-bit chunk at bit_offset starting at bidx:
+        // We load a 16-bit sliding window starting from bidx (Big-Endian).
+        uint val = (uint(final_pubkey[bidx]) << 8);
+        if (bidx + 1 < 32) val |= uint(final_pubkey[bidx + 1]);
+
+        // We shift the window down so the 5 bits we want are at the bottom.
+        // The leftmost bit of the 16-bit window is bit 0 of the first byte (MSB).
+        // We want the 5 bits starting at bit offset bsft.
+        // The total bits in our window to the right of our target 5-bit block is: 16 - bsft - 5 = 11 - bsft.
+        uint shift = 11u - uint(bsft);
+
+        fast_prefix[i] = b32_alphabet[(val >> shift) & 31u];
+        bit_offset += 5;
+    }
 
     bool match = true;
     for (uint i = 0; i < pc.prefix_len; ++i) {
-        if (generated_prefix[i] != target_prefix[i]) {
+        if (fast_prefix[i] != target_prefix[i]) {
             match = false;
             break;
         }
