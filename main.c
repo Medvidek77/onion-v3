@@ -36,6 +36,13 @@ typedef struct {
 typedef struct {
     int32_t YplusX[10];
     int32_t YminusX[10];
+    int32_t Z2[10];
+    int32_t T[10];
+} gpu_ge_precomp_base;
+
+typedef struct {
+    int32_t YplusX[10];
+    int32_t YminusX[10];
     int32_t Z[10];
     int32_t T2d[10];
 } gpu_ge_cached;
@@ -71,10 +78,15 @@ void fe_copy_to_gpu(int32_t* dst, const fe src) {
     for (int i=0; i<10; i++) dst[i] = src[i];
 }
 
-void convert_p3_to_gpu(gpu_ge_p3* dst, const ge_p3* src) {
-    fe_copy_to_gpu(dst->X, src->X);
-    fe_copy_to_gpu(dst->Y, src->Y);
-    fe_copy_to_gpu(dst->Z, src->Z);
+void convert_p3_to_gpu(gpu_ge_precomp_base* dst, const ge_p3* src) {
+    fe tmpYplusX, tmpYminusX, tmpZ2;
+    fe_add(tmpYplusX, src->Y, src->X);
+    fe_sub(tmpYminusX, src->Y, src->X);
+    fe_add(tmpZ2, src->Z, src->Z);
+
+    fe_copy_to_gpu(dst->YplusX, tmpYplusX);
+    fe_copy_to_gpu(dst->YminusX, tmpYminusX);
+    fe_copy_to_gpu(dst->Z2, tmpZ2);
     fe_copy_to_gpu(dst->T, src->T);
 }
 
@@ -255,12 +267,12 @@ int main(int argc, char** argv) {
     vkGetDeviceQueue(device, computeFamily, 0, &computeQueue);
 
     // Buffers setup
-    size_t basepoint_size = sizeof(gpu_ge_p3);
+    size_t basepoint_size = sizeof(gpu_ge_precomp_base);
     size_t offsets_size = BATCH_SIZE * sizeof(gpu_ge_cached);
     size_t result_size = sizeof(int);
 
     // Allocate host buffers
-    gpu_ge_p3 host_basepoint;
+    gpu_ge_precomp_base host_basepoint[2];
     gpu_ge_cached* host_offsets = malloc(offsets_size);
     generate_offsets(host_offsets, BATCH_SIZE);
 
@@ -268,18 +280,20 @@ int main(int argc, char** argv) {
     VkMemoryAllocateInfo allocInfo = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     VkMemoryRequirements memReqs;
 
-    // BasePoint buffer
+    // BasePoint buffers (Double Buffered)
     bufferInfo.size = basepoint_size;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer basepointBuffer;
-    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &basepointBuffer));
-    vkGetBufferMemoryRequirements(device, basepointBuffer, &memReqs);
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory basepointMemory;
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &basepointMemory));
-    vkBindBufferMemory(device, basepointBuffer, basepointMemory, 0);
+    VkBuffer basepointBuffer[2];
+    VkDeviceMemory basepointMemory[2];
+    for (int i=0; i<2; i++) {
+        VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &basepointBuffer[i]));
+        vkGetBufferMemoryRequirements(device, basepointBuffer[i], &memReqs);
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &basepointMemory[i]));
+        vkBindBufferMemory(device, basepointBuffer[i], basepointMemory[i], 0);
+    }
 
     // Offsets buffer
     bufferInfo.size = offsets_size;
@@ -317,17 +331,19 @@ int main(int argc, char** argv) {
     memcpy(mappedPrefix, prefix, prefix_len);
     vkUnmapMemory(device, prefixMemory);
 
-    // Result buffer
+    // Result buffer (Double Buffered)
     bufferInfo.size = result_size;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    VkBuffer resultBuffer;
-    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &resultBuffer));
-    vkGetBufferMemoryRequirements(device, resultBuffer, &memReqs);
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory resultMemory;
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &resultMemory));
-    vkBindBufferMemory(device, resultBuffer, resultMemory, 0);
+    VkBuffer resultBuffer[2];
+    VkDeviceMemory resultMemory[2];
+    for (int i=0; i<2; i++) {
+        VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &resultBuffer[i]));
+        vkGetBufferMemoryRequirements(device, resultBuffer[i], &memReqs);
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &resultMemory[i]));
+        vkBindBufferMemory(device, resultBuffer[i], resultMemory[i], 0);
+    }
 
     // Load shader
     FILE* f = fopen("shader.spv", "rb");
@@ -402,43 +418,48 @@ int main(int argc, char** argv) {
     VkPipeline computePipeline;
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &computePipeline));
 
-    // Descriptor Pool
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
+    // Descriptor Pool (Double Buffered)
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1,
+        .maxSets = 2,
         .poolSizeCount = 1,
         .pPoolSizes = &poolSize
     };
     VkDescriptorPool descriptorPool;
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, NULL, &descriptorPool));
 
-    // Descriptor Set
+    // Descriptor Sets
+    VkDescriptorSetLayout layouts[2] = { descriptorSetLayout, descriptorSetLayout };
     VkDescriptorSetAllocateInfo allocSetInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptorPool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &descriptorSetLayout
+        .descriptorSetCount = 2,
+        .pSetLayouts = layouts
     };
-    VkDescriptorSet descriptorSet;
-    VK_CHECK(vkAllocateDescriptorSets(device, &allocSetInfo, &descriptorSet));
+    VkDescriptorSet descriptorSets[2];
+    VK_CHECK(vkAllocateDescriptorSets(device, &allocSetInfo, descriptorSets));
 
-    VkDescriptorBufferInfo baseBufInfo = { basepointBuffer, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo offsetBufInfo = { offsetsBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo prefixBufInfo = { prefixBuffer, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo resultBufInfo = { resultBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo offsetBufInfo = { offsetsBuffer, 0, VK_WHOLE_SIZE };
 
-    VkWriteDescriptorSet descriptorWrites[4] = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &prefixBufInfo, NULL },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
-    };
-    vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, NULL);
+    for (int i=0; i<2; i++) {
+        VkDescriptorBufferInfo baseBufInfo = { basepointBuffer[i], 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo resultBufInfo = { resultBuffer[i], 0, VK_WHOLE_SIZE };
 
-    // Command Pool & Buffer
+        VkWriteDescriptorSet descriptorWrites[4] = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &prefixBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+        };
+        vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, NULL);
+    }
+
+    // Command Pool & Buffers (Double Buffered)
     VkCommandPoolCreateInfo cmdPoolInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = computeFamily
     };
     VkCommandPool commandPool;
@@ -448,68 +469,89 @@ int main(int argc, char** argv) {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = commandPool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1
+        .commandBufferCount = 2
     };
-    VkCommandBuffer commandBuffer;
-    VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &commandBuffer));
+    VkCommandBuffer commandBuffers[2];
+    VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, commandBuffers));
 
-    // Record Command Buffer
-    VkCommandBufferBeginInfo beginInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
+    // Record Command Buffers
+    for (int i=0; i<2; i++) {
+        VkCommandBufferBeginInfo beginInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        VK_CHECK(vkBeginCommandBuffer(commandBuffers[i], &beginInfo));
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSets[i], 0, NULL);
 
-    uint32_t pushConstants[2] = { BATCH_SIZE, (uint32_t)prefix_len };
-    vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
+        uint32_t pushConstants[2] = { BATCH_SIZE, (uint32_t)prefix_len };
+        vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
 
-    vkCmdDispatch(commandBuffer, BATCH_SIZE / 64, 1, 1);
-    VK_CHECK(vkEndCommandBuffer(commandBuffer));
+        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / 64, 1, 1);
+        VK_CHECK(vkEndCommandBuffer(commandBuffers[i]));
+    }
+
+    VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+    VkFence fences[2];
+    VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[0]));
+    VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
 
     printf("Starting search for prefix '%s' via Vulkan...\n", prefix);
 
     uint64_t total_checked = 0;
     bool found = false;
 
-    void* mappedBasepoint;
-    vkMapMemory(device, basepointMemory, 0, basepoint_size, 0, &mappedBasepoint);
-    void* mappedResult;
-    vkMapMemory(device, resultMemory, 0, result_size, 0, &mappedResult);
+    void* mappedBasepoint[2];
+    void* mappedResult[2];
+    for (int i=0; i<2; i++) {
+        vkMapMemory(device, basepointMemory[i], 0, basepoint_size, 0, &mappedBasepoint[i]);
+        vkMapMemory(device, resultMemory[i], 0, result_size, 0, &mappedResult[i]);
+    }
 
-    uint8_t base_secret[32];
+    uint8_t base_secret[2][32];
+    unsigned char h_scalars[2][64];
 
     double start_time = get_time_sec();
     double last_print_time = start_time;
 
+    int cur_frame = 0;
+
+    // Prefill frame 0
+    randombytes_buf(base_secret[0], 32);
+    crypto_hash_sha512(h_scalars[0], base_secret[0], 32);
+    h_scalars[0][0] &= 248; h_scalars[0][31] &= 127; h_scalars[0][31] |= 64;
+    ge_p3 base_p3;
+    ge_scalarmult_base(&base_p3, h_scalars[0]);
+    convert_p3_to_gpu(&host_basepoint[0], &base_p3);
+    memcpy(mappedBasepoint[0], &host_basepoint[0], basepoint_size);
+    int init_res = -1;
+    memcpy(mappedResult[0], &init_res, sizeof(int));
+
+    vkResetFences(device, 1, &fences[0]);
+    VkSubmitInfo subInfo = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &commandBuffers[0] };
+    VK_CHECK(vkQueueSubmit(computeQueue, 1, &subInfo, fences[0]));
+
     while (!found) {
-        // Only ONE key generation per million on CPU now!
-        randombytes_buf(base_secret, 32);
+        int next_frame = 1 - cur_frame;
 
-        unsigned char h[64];
-        crypto_hash_sha512(h, base_secret, 32);
-        h[0] &= 248;
-        h[31] &= 127;
-        h[31] |= 64;
+        // Asynchronously prepare the NEXT frame on the CPU
+        randombytes_buf(base_secret[next_frame], 32);
+        crypto_hash_sha512(h_scalars[next_frame], base_secret[next_frame], 32);
+        h_scalars[next_frame][0] &= 248; h_scalars[next_frame][31] &= 127; h_scalars[next_frame][31] |= 64;
+        ge_scalarmult_base(&base_p3, h_scalars[next_frame]);
+        convert_p3_to_gpu(&host_basepoint[next_frame], &base_p3);
+        memcpy(mappedBasepoint[next_frame], &host_basepoint[next_frame], basepoint_size);
+        int init_res2 = -1;
+        memcpy(mappedResult[next_frame], &init_res2, sizeof(int));
 
-        ge_p3 base_p3;
-        ge_scalarmult_base(&base_p3, h);
+        // Wait for the CURRENT frame to finish hashing on the GPU
+        VK_CHECK(vkWaitForFences(device, 1, &fences[cur_frame], VK_TRUE, UINT64_MAX));
 
-        convert_p3_to_gpu(&host_basepoint, &base_p3);
+        // Immediately submit the NEXT frame so the GPU doesn't stall while we check the results of the current frame
+        vkResetFences(device, 1, &fences[next_frame]);
+        VkSubmitInfo subInfo2 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &commandBuffers[next_frame] };
+        VK_CHECK(vkQueueSubmit(computeQueue, 1, &subInfo2, fences[next_frame]));
 
-        memcpy(mappedBasepoint, &host_basepoint, basepoint_size);
-
-        int init_result = -1;
-        memcpy(mappedResult, &init_result, sizeof(int));
-
-        VkSubmitInfo submitInfo = {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &commandBuffer
-        };
-        VK_CHECK(vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(computeQueue));
-
+        // Check results of the CURRENT frame
         int result_index;
-        memcpy(&result_index, mappedResult, sizeof(int));
+        memcpy(&result_index, mappedResult[cur_frame], sizeof(int));
 
         total_checked += BATCH_SIZE;
 
@@ -522,6 +564,7 @@ int main(int argc, char** argv) {
         }
 
         if (result_index != -1) {
+            unsigned char* h = h_scalars[cur_frame];
             // To get the actual secret, we take our base scalar `h`
             // and add `result_index * 8` to it.
             // We use sc_muladd to safely add in the scalar field.
@@ -550,25 +593,19 @@ int main(int argc, char** argv) {
             unsigned char checksum[32];
             crypto_generichash(checksum, 32, checksum_input, 48, NULL, 0); // SHA3 equivalent via libsodium blake2b or similar
 
-            // Actually, tor uses SHA3-256, libsodium crypto_generichash uses Blake2b.
-            // But we already have the hash logic inside the GPU, we just need to reconstruct the address for display.
-            // Since mkp224o and standard tools use SHA3, let's just do a proper SHA3 or use the existing bytes.
-            // For simplicity, we just use our embedded sha512.c ? No, we need SHA3.
-            // Let's just format it correctly using standard mkp224o `sha3` if needed, but since we didn't pull sha3.c,
-            // we will pull a minimal sha3 or just print it from GPU if we return the full 15 chars.
-            // Wait, we can just use the provided SHA3 code from libsodium? Libsodium doesn't have SHA3-256.
-            // We can just print the success message. Let's write the key to a uniquely named folder based on pubkey.
+            // In place of an exact pure-sha3 encoder on host, we can reconstruct the full onion
+            // We know the prefix matches, but we want to display the full string like mkp224o.
+            // But we don't have SHA3 on the CPU easily accessible right now without dragging a library.
+            // We can just print the success folder output cleanly without overwriting the H/s meter.
 
             char path[512];
             if (snprintf(path, sizeof(path), "%s/%s_keys_%u", out_dir, prefix, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
-                printf("Output path too long.\n");
                 continue;
             }
             mkdir(path, 0700);
 
             char key_path[550];
             if (snprintf(key_path, sizeof(key_path), "%s/hs_ed25519_secret_key", path) >= (int)sizeof(key_path)) {
-                printf("Key path too long.\n");
                 continue;
             }
 
@@ -576,26 +613,28 @@ int main(int argc, char** argv) {
             if (f) {
                 char header[32] = "== ed25519v1-secret: type0 ==\0\0\0";
                 fwrite(header, 1, 32, f);
-
                 unsigned char expanded_sk[64];
-                memcpy(expanded_sk, final_scalar, 32); // Lower 32 is the scalar
-                memcpy(expanded_sk + 32, match_pubkey, 32); // Upper 32 is the pubkey
-
+                memcpy(expanded_sk, final_scalar, 32);
+                memcpy(expanded_sk + 32, match_pubkey, 32);
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
-                printf("\nFound match! Secret key written to: %s\n", key_path);
-            } else {
-                printf("Failed to open %s for writing.\n", key_path);
+                printf("\n%s\n", path); // Print only the folder path like mkp224o's quiet mode
             }
 
             // DO NOT exit. Just clear the result index and keep searching.
-            init_result = -1;
-            memcpy(mappedResult, &init_result, sizeof(int));
+            int clr_res = -1;
+            memcpy(mappedResult[cur_frame], &clr_res, sizeof(int));
         }
+
+        cur_frame = next_frame;
     }
 
-    vkUnmapMemory(device, basepointMemory);
-    vkUnmapMemory(device, resultMemory);
+    vkWaitForFences(device, 2, fences, VK_TRUE, UINT64_MAX);
+
+    for (int i=0; i<2; i++) {
+        vkUnmapMemory(device, basepointMemory[i]);
+        vkUnmapMemory(device, resultMemory[i]);
+    }
 
     // Cleanup
     free(host_offsets);
@@ -607,14 +646,18 @@ int main(int argc, char** argv) {
     vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
     vkDestroyShaderModule(device, computeShaderModule, NULL);
 
-    vkDestroyBuffer(device, basepointBuffer, NULL);
-    vkFreeMemory(device, basepointMemory, NULL);
+    for (int i=0; i<2; i++) {
+        vkDestroyBuffer(device, basepointBuffer[i], NULL);
+        vkFreeMemory(device, basepointMemory[i], NULL);
+        vkDestroyBuffer(device, resultBuffer[i], NULL);
+        vkFreeMemory(device, resultMemory[i], NULL);
+        vkDestroyFence(device, fences[i], NULL);
+    }
+
     vkDestroyBuffer(device, offsetsBuffer, NULL);
     vkFreeMemory(device, offsetsMemory, NULL);
     vkDestroyBuffer(device, prefixBuffer, NULL);
     vkFreeMemory(device, prefixMemory, NULL);
-    vkDestroyBuffer(device, resultBuffer, NULL);
-    vkFreeMemory(device, resultMemory, NULL);
 
     vkDestroyDevice(device, NULL);
     vkDestroyInstance(instance, NULL);
