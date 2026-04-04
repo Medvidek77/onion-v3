@@ -57,8 +57,6 @@ uint64_t ROL64(uint64_t a, uint offset) {
     return (a << offset) ^ (a >> (64u - offset));
 }
 
-shared int shared_products[256][10];
-
 #define KECCAK_ROUND(r) \
     bc[0] = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20]; \
     bc[1] = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21]; \
@@ -355,7 +353,9 @@ void fe_tobytes(out uint8_t s[32], in int h[10]) {
     s[28] = uint8_t((h8 >> 19) | (h9 << 6)); s[29] = uint8_t(h9 >> 2); s[30] = uint8_t(h9 >> 10); s[31] = uint8_t(h9 >> 18);
 }
 
-void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10], in int recip[10]) {
+void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10]) {
+    int recip[10];
+    fe_invert(recip, Z);
     int x[10], y[10];
     fe_mul(x, X, recip);
     fe_mul(y, Y, recip);
@@ -445,37 +445,8 @@ void main() {
             base_point.X, base_point.Y, base_point.Z, base_point.T,
             offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
-    uint lid = gl_LocalInvocationID.x;
-    for (int i=0; i<10; i++) shared_products[lid][i] = R_Z[i];
-    barrier();
-
-    // Proper sequential Montgomery batch inversion on thread 0
-    // This reduces workgroup inversions from 256 to 1!
-    if (lid == 0) {
-        int prods[256][10];
-        for (int i=0; i<10; i++) prods[0][i] = shared_products[0][i];
-        for (int i=1; i<256; i++) {
-            fe_mul(prods[i], prods[i-1], shared_products[i]);
-        }
-
-        int inv[10];
-        fe_invert(inv, prods[255]); // ONLY 1 FULL INVERSION!
-
-        for (int i=255; i>0; i--) {
-            int cur_z[10];
-            for (int j=0; j<10; j++) cur_z[j] = shared_products[i][j];
-            fe_mul(shared_products[i], inv, prods[i-1]);
-            fe_mul(inv, inv, cur_z);
-        }
-        for (int j=0; j<10; j++) shared_products[0][j] = inv[j];
-    }
-    barrier();
-
-    int recip[10];
-    for (int i=0; i<10; i++) recip[i] = shared_products[lid][i];
-
     uint8_t final_pubkey[32];
-    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z, recip);
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z);
 
     uint8_t generated_prefix[16];
     pubkey_to_base32_prefix(final_pubkey, generated_prefix, pc.prefix_len);
