@@ -165,7 +165,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    clEnqueueWriteBuffer(queue, d_prefix, CL_TRUE, 0, prefix_len, prefix, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(queue, d_prefix, CL_TRUE, 0, prefix_len, prefix, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("Failed to enqueue prefix to device memory (err %d).\n", err);
+        clReleaseMemObject(d_pubkeys);
+        clReleaseMemObject(d_prefix);
+        clReleaseMemObject(d_result);
+        free(host_pubkeys);
+        free(host_secrets);
+        clReleaseKernel(kernel);
+        clReleaseProgram(prog);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(ctx);
+        free(source);
+        return 1;
+    }
 
     uint32_t batch_size = BATCH_SIZE;
     uint32_t cl_prefix_len = (uint32_t)prefix_len;
@@ -188,15 +202,31 @@ int main(int argc, char** argv) {
             get_pubkey(&host_secrets[i * 32], &host_pubkeys[i * 32]);
         }
 
-        clEnqueueWriteBuffer(queue, d_pubkeys, CL_TRUE, 0, pubkeys_size, host_pubkeys, 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(queue, d_pubkeys, CL_TRUE, 0, pubkeys_size, host_pubkeys, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            printf("Failed to enqueue write buffer (pubkeys): err %d\n", err);
+            break;
+        }
 
         int result_index = -1;
-        clEnqueueWriteBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            printf("Failed to enqueue write buffer (result): err %d\n", err);
+            break;
+        }
 
         size_t global_work_size = BATCH_SIZE;
-        clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            printf("Failed to enqueue NDRangeKernel: err %d\n", err);
+            break;
+        }
 
-        clEnqueueReadBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
+        err = clEnqueueReadBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            printf("Failed to enqueue read buffer (result): err %d\n", err);
+            break;
+        }
 
         total_checked += BATCH_SIZE;
         if (total_checked % (BATCH_SIZE * 10) == 0) {
@@ -238,6 +268,8 @@ int main(int argc, char** argv) {
                 fwrite(expanded_sk, 1, 64, f);
                 fclose(f);
                 printf("Secret key written to: %s\n", key_path);
+            } else {
+                printf("Failed to open %s for writing.\n", key_path);
             }
             found = true;
         }
