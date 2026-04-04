@@ -21,7 +21,7 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 23) // 8 million keys per batch (to saturate GPU)
+#define BATCH_SIZE (1 << 21) // 2 million keys per batch (~320MB offset buffer, fits in standard 256MB/512MB BAR)
 #define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
 
 
