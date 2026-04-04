@@ -255,6 +255,15 @@ void ge_madd(out int r_X[10], out int r_Y[10], out int r_Z[10], out int r_T[10],
     fe_mul(r_T, A, B);
 }
 
+void fe_sq_n(out int h[10], in int f[10], int n) {
+    int temp[10];
+    fe_sq(temp, f);
+    for (int i = 1; i < n; ++i) {
+        fe_sq(temp, temp);
+    }
+    for (int i = 0; i < 10; ++i) h[i] = temp[i];
+}
+
 void fe_invert(out int out_fe[10], in int z[10]) {
     int t0[10], t1[10], t2[10], t3[10];
 
@@ -265,29 +274,21 @@ void fe_invert(out int out_fe[10], in int z[10]) {
     fe_mul(t0, t0, t1);
     fe_sq(t2, t0);
     fe_mul(t1, t1, t2);
-    fe_sq(t2, t1);
-    for(int i=1;i<5;++i) fe_sq(t2, t2);
+    fe_sq_n(t2, t1, 5);
     fe_mul(t1, t2, t1);
-    fe_sq(t2, t1);
-    for(int i=1;i<10;++i) fe_sq(t2, t2);
+    fe_sq_n(t2, t1, 10);
     fe_mul(t2, t2, t1);
-    fe_sq(t3, t2);
-    for(int i=1;i<20;++i) fe_sq(t3, t3);
+    fe_sq_n(t3, t2, 20);
     fe_mul(t2, t3, t2);
-    fe_sq(t2, t2);
-    for(int i=1;i<10;++i) fe_sq(t2, t2);
+    fe_sq_n(t2, t2, 10);
     fe_mul(t1, t2, t1);
-    fe_sq(t2, t1);
-    for(int i=1;i<50;++i) fe_sq(t2, t2);
+    fe_sq_n(t2, t1, 50);
     fe_mul(t2, t2, t1);
-    fe_sq(t3, t2);
-    for(int i=1;i<100;++i) fe_sq(t3, t3);
+    fe_sq_n(t3, t2, 100);
     fe_mul(t2, t3, t2);
-    fe_sq(t2, t2);
-    for(int i=1;i<50;++i) fe_sq(t2, t2);
+    fe_sq_n(t2, t2, 50);
     fe_mul(t1, t2, t1);
-    fe_sq(t1, t1);
-    for(int i=1;i<5;++i) fe_sq(t1, t1);
+    fe_sq_n(t1, t1, 5);
     fe_mul(out_fe, t1, t0);
 }
 
