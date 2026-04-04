@@ -36,20 +36,6 @@ void get_pubkey(const unsigned char *sk, unsigned char *pk) {
     crypto_scalarmult_ed25519_base_noclamp(pk, h);
 }
 
-// Generate base32 string for the address
-void get_onion_address(const unsigned char* pubkey, char* address) {
-    unsigned char checksum_input[48];
-    memcpy(checksum_input, ".onion checksum", 15);
-    memcpy(checksum_input + 15, pubkey, 32);
-    checksum_input[47] = 0x03;
-
-    unsigned char checksum[32]; // sha3-256
-    crypto_generichash(checksum, 32, checksum_input, 48, NULL, 0); // Note: standard ed25519 uses sha3-256 not blake2b, but for demonstration we'll just implement the host side verification correctly. Actually libsodium doesn't have sha3-256 natively exposed simply.
-    // We will use the kernel for verification or write a simple sha3 host fallback if needed.
-    // For now we will print a placeholder or run the address gen via a known good library if we needed it in host.
-    // Since mkp224o uses an internal keccak, we can include a small one or just rely on the found index!
-}
-
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <prefix> <output_dir>\n", argv[0]);
