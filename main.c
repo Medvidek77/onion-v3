@@ -4,42 +4,32 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/stat.h>
-
-#define CL_TARGET_OPENCL_VERSION 120
-#include <CL/cl.h>
+#include <vulkan/vulkan.h>
 #include <sodium.h>
 
 #define BATCH_SIZE (1 << 20) // 1 million keys per batch
 
-char* load_kernel_source(const char* filename, size_t* size_ret) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    if (size < 0) {
-        fclose(f);
-        return NULL;
+#define VK_CHECK(x) \
+    do { \
+        VkResult err = x; \
+        if (err) { \
+            fprintf(stderr, "Vulkan error %d at %s:%d\n", err, __FILE__, __LINE__); \
+            exit(1); \
+        } \
+    } while (0)
+
+uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
     }
-    fseek(f, 0, SEEK_SET);
-    char* source = malloc((size_t)size + 1);
-    if (!source) {
-        fclose(f);
-        return NULL;
-    }
-    size_t read_bytes = fread(source, 1, (size_t)size, f);
-    if (read_bytes != (size_t)size) {
-        free(source);
-        fclose(f);
-        return NULL;
-    }
-    source[size] = '\0';
-    fclose(f);
-    if (size_ret) *size_ret = (size_t)size;
-    return source;
+    fprintf(stderr, "Failed to find suitable memory type\n");
+    exit(1);
 }
 
-// Basic ed25519 scalar multiplication to get public key from secret.
-// libsodium has crypto_scalarmult_ed25519_base_noclamp
 void get_pubkey(const unsigned char *sk, unsigned char *pk) {
     unsigned char h[64];
     crypto_hash_sha512(h, sk, 32);
@@ -71,191 +61,310 @@ int main(int argc, char** argv) {
 
     mkdir(out_dir, 0700);
 
-    // Initialize OpenCL: iterate over all platforms to find a GPU, fallback to CPU
-    cl_uint num_platforms = 0;
-    cl_int err = clGetPlatformIDs(0, NULL, &num_platforms);
-    if (err != CL_SUCCESS || num_platforms == 0) {
-        printf("Failed to find OpenCL platforms (err %d). Running in sandbox might not have OpenCL available.\n", err);
-        return 0; // Graceful exit
+    // Vulkan Initialization
+    VkApplicationInfo appInfo = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "TorVanityVulkan",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "No Engine",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_1
+    };
+
+    VkInstanceCreateInfo createInfo = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &appInfo,
+        .enabledLayerCount = 0,
+        .enabledExtensionCount = 0
+    };
+
+    VkInstance instance;
+    if (vkCreateInstance(&createInfo, NULL, &instance) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create Vulkan instance.\n");
+        return 1;
     }
 
-    cl_platform_id* platforms = malloc(sizeof(cl_platform_id) * num_platforms);
-    clGetPlatformIDs(num_platforms, platforms, NULL);
+    uint32_t deviceCount = 0;
+    vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
+    if (deviceCount == 0) {
+        fprintf(stderr, "Failed to find GPUs with Vulkan support.\n");
+        return 1;
+    }
+    VkPhysicalDevice* physicalDevices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
+    vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices);
 
-    cl_platform_id platform = NULL;
-    cl_device_id device = NULL;
+    // Just pick the first device for simplicity (usually the discrete GPU on a standard setup)
+    VkPhysicalDevice physicalDevice = physicalDevices[0];
+    VkPhysicalDeviceProperties deviceProperties;
+    vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+    printf("Using Vulkan Device: %s\n", deviceProperties.deviceName);
+    free(physicalDevices);
 
-    // First pass: try to find a GPU
-    for (cl_uint i = 0; i < num_platforms; ++i) {
-        err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-        if (err == CL_SUCCESS && device) {
-            platform = platforms[i];
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, NULL);
+    VkQueueFamilyProperties* queueFamilies = malloc(sizeof(VkQueueFamilyProperties) * queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies);
+
+    uint32_t computeFamily = -1;
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            computeFamily = i;
             break;
         }
     }
-
-    // Second pass: fallback to CPU
-    if (!device) {
-        for (cl_uint i = 0; i < num_platforms; ++i) {
-            err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_CPU, 1, &device, NULL);
-            if (err == CL_SUCCESS && device) {
-                platform = platforms[i];
-                break;
-            }
-        }
-    }
-
-    free(platforms);
-
-    if (!device || !platform) {
-        printf("Failed to find OpenCL GPU/CPU device.\n");
-        return 0;
-    }
-
-    char device_name[128];
-    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
-    printf("Using GPU: %s\n", device_name);
-
-    cl_context ctx = clCreateContext(NULL, 1, &device, NULL, NULL, NULL);
-    cl_command_queue queue = clCreateCommandQueue(ctx, device, 0, NULL);
-
-    size_t source_size;
-    char* source = load_kernel_source("kernel.cl", &source_size);
-    if (!source) {
-        printf("Failed to load kernel.cl\n");
+    free(queueFamilies);
+    if (computeFamily == (uint32_t)-1) {
+        fprintf(stderr, "Failed to find compute queue family.\n");
         return 1;
     }
 
-    cl_program prog = clCreateProgramWithSource(ctx, 1, (const char**)&source, &source_size, NULL);
-    clBuildProgram(prog, 1, &device, NULL, NULL, NULL);
+    float queuePriority = 1.0f;
+    VkDeviceQueueCreateInfo queueCreateInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = computeFamily,
+        .queueCount = 1,
+        .pQueuePriorities = &queuePriority
+    };
 
-    // Check build log
-    size_t log_size;
-    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
-    if (log_size > 1) {
-        char* log = malloc(log_size);
-        if (log) {
-            clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
-            printf("Build log:\n%s\n", log);
-            free(log);
-        }
-    }
+    const char* deviceExtensions[] = {
+        VK_KHR_8BIT_STORAGE_EXTENSION_NAME
+    };
 
-    cl_kernel kernel = clCreateKernel(prog, "vanity_search", &err);
-    if (err != CL_SUCCESS || !kernel) {
-        printf("Failed to create kernel (err %d).\n", err);
-        clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
-        free(source);
-        return 1;
-    }
+    VkPhysicalDevice8BitStorageFeatures features8 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
+        .storageBuffer8BitAccess = VK_TRUE
+    };
 
-    // Setup buffers
+    VkDeviceCreateInfo deviceCreateInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &features8,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queueCreateInfo,
+        .enabledExtensionCount = 1,
+        .ppEnabledExtensionNames = deviceExtensions
+    };
+
+    VkDevice device;
+    VK_CHECK(vkCreateDevice(physicalDevice, &deviceCreateInfo, NULL, &device));
+
+    VkQueue computeQueue;
+    vkGetDeviceQueue(device, computeFamily, 0, &computeQueue);
+
+    // Buffers setup
     size_t pubkeys_size = BATCH_SIZE * 32;
+    size_t result_size = sizeof(int);
+
     uint8_t* host_pubkeys = malloc(pubkeys_size);
-    uint8_t* host_secrets = malloc(pubkeys_size); // to keep track of secrets
+    uint8_t* host_secrets = malloc(pubkeys_size);
 
-    if (!host_pubkeys || !host_secrets) {
-        printf("Failed to allocate host memory.\n");
-        if (host_pubkeys) free(host_pubkeys);
-        if (host_secrets) free(host_secrets);
-        clReleaseKernel(kernel);
-        clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
-        free(source);
+    VkBufferCreateInfo bufferInfo = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkMemoryAllocateInfo allocInfo = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryRequirements memReqs;
+
+    // Pubkeys buffer
+    bufferInfo.size = pubkeys_size;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer pubkeysBuffer;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &pubkeysBuffer));
+    vkGetBufferMemoryRequirements(device, pubkeysBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory pubkeysMemory;
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &pubkeysMemory));
+    vkBindBufferMemory(device, pubkeysBuffer, pubkeysMemory, 0);
+
+    // Prefix buffer
+    bufferInfo.size = prefix_len;
+    VkBuffer prefixBuffer;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &prefixBuffer));
+    vkGetBufferMemoryRequirements(device, prefixBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory prefixMemory;
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &prefixMemory));
+    vkBindBufferMemory(device, prefixBuffer, prefixMemory, 0);
+
+    // Write prefix
+    void* mappedPrefix;
+    vkMapMemory(device, prefixMemory, 0, prefix_len, 0, &mappedPrefix);
+    memcpy(mappedPrefix, prefix, prefix_len);
+    vkUnmapMemory(device, prefixMemory);
+
+    // Result buffer
+    bufferInfo.size = result_size;
+    VkBuffer resultBuffer;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &resultBuffer));
+    vkGetBufferMemoryRequirements(device, resultBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory resultMemory;
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &resultMemory));
+    vkBindBufferMemory(device, resultBuffer, resultMemory, 0);
+
+    // Load shader
+    FILE* f = fopen("shader.spv", "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open shader.spv. Did you compile it?\n");
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    size_t shaderSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint32_t* shaderCode = malloc(shaderSize);
+    size_t read_bytes = fread(shaderCode, 1, shaderSize, f);
+    fclose(f);
+    if (read_bytes != shaderSize) {
+        fprintf(stderr, "Failed to read full shader.spv\n");
+        free(shaderCode);
         return 1;
     }
 
-    cl_mem d_pubkeys = clCreateBuffer(ctx, CL_MEM_READ_ONLY, pubkeys_size, NULL, &err);
-    cl_mem d_prefix = clCreateBuffer(ctx, CL_MEM_READ_ONLY, prefix_len, NULL, &err);
-    cl_mem d_result = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int), NULL, &err);
+    VkShaderModuleCreateInfo shaderInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = shaderSize,
+        .pCode = shaderCode
+    };
+    VkShaderModule computeShaderModule;
+    VK_CHECK(vkCreateShaderModule(device, &shaderInfo, NULL, &computeShaderModule));
+    free(shaderCode);
 
-    if (!d_pubkeys || !d_prefix || !d_result) {
-        printf("Failed to allocate device memory.\n");
-        if (d_pubkeys) clReleaseMemObject(d_pubkeys);
-        if (d_prefix) clReleaseMemObject(d_prefix);
-        if (d_result) clReleaseMemObject(d_result);
-        free(host_pubkeys);
-        free(host_secrets);
-        clReleaseKernel(kernel);
-        clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
-        free(source);
-        return 1;
-    }
+    // Descriptor set layout
+    VkDescriptorSetLayoutBinding bindings[3] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = bindings
+    };
+    VkDescriptorSetLayout descriptorSetLayout;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &descriptorSetLayout));
 
-    err = clEnqueueWriteBuffer(queue, d_prefix, CL_TRUE, 0, prefix_len, prefix, 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        printf("Failed to enqueue prefix to device memory (err %d).\n", err);
-        clReleaseMemObject(d_pubkeys);
-        clReleaseMemObject(d_prefix);
-        clReleaseMemObject(d_result);
-        free(host_pubkeys);
-        free(host_secrets);
-        clReleaseKernel(kernel);
-        clReleaseProgram(prog);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(ctx);
-        free(source);
-        return 1;
-    }
+    // Pipeline Layout
+    VkPushConstantRange pushConstantRange = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(uint32_t) * 2 // batch_size and prefix_len
+    };
 
-    uint32_t batch_size = BATCH_SIZE;
-    uint32_t cl_prefix_len = (uint32_t)prefix_len;
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &descriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstantRange
+    };
+    VkPipelineLayout pipelineLayout;
+    VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, NULL, &pipelineLayout));
 
-    clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_pubkeys);
-    clSetKernelArg(kernel, 1, sizeof(uint32_t), &batch_size);
-    clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_prefix);
-    clSetKernelArg(kernel, 3, sizeof(uint32_t), &cl_prefix_len);
-    clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_result);
+    // Compute Pipeline
+    VkComputePipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = computeShaderModule,
+            .pName = "main"
+        },
+        .layout = pipelineLayout
+    };
+    VkPipeline computePipeline;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &computePipeline));
 
-    printf("Starting search for prefix '%s'...\n", prefix);
+    // Descriptor Pool
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize
+    };
+    VkDescriptorPool descriptorPool;
+    VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, NULL, &descriptorPool));
+
+    // Descriptor Set
+    VkDescriptorSetAllocateInfo allocSetInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &descriptorSetLayout
+    };
+    VkDescriptorSet descriptorSet;
+    VK_CHECK(vkAllocateDescriptorSets(device, &allocSetInfo, &descriptorSet));
+
+    VkDescriptorBufferInfo pubkeysBufInfo = { pubkeysBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo prefixBufInfo = { prefixBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo resultBufInfo = { resultBuffer, 0, VK_WHOLE_SIZE };
+
+    VkWriteDescriptorSet descriptorWrites[3] = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &pubkeysBufInfo, NULL },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &prefixBufInfo, NULL },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+    };
+    vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
+
+    // Command Pool & Buffer
+    VkCommandPoolCreateInfo cmdPoolInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = computeFamily
+    };
+    VkCommandPool commandPool;
+    VK_CHECK(vkCreateCommandPool(device, &cmdPoolInfo, NULL, &commandPool));
+
+    VkCommandBufferAllocateInfo cmdAllocInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer commandBuffer;
+    VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &commandBuffer));
+
+    // Record Command Buffer
+    VkCommandBufferBeginInfo beginInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
+
+    uint32_t pushConstants[2] = { BATCH_SIZE, (uint32_t)prefix_len };
+    vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
+
+    vkCmdDispatch(commandBuffer, BATCH_SIZE / 256, 1, 1);
+    VK_CHECK(vkEndCommandBuffer(commandBuffer));
+
+    printf("Starting search for prefix '%s' via Vulkan...\n", prefix);
 
     uint64_t total_checked = 0;
     bool found = false;
 
+    void* mappedPubkeys;
+    vkMapMemory(device, pubkeysMemory, 0, pubkeys_size, 0, &mappedPubkeys);
+    void* mappedResult;
+    vkMapMemory(device, resultMemory, 0, result_size, 0, &mappedResult);
+
     while (!found) {
-        // Generate random keys for this batch
         for (int i = 0; i < BATCH_SIZE; ++i) {
             randombytes_buf(&host_secrets[i * 32], 32);
             get_pubkey(&host_secrets[i * 32], &host_pubkeys[i * 32]);
         }
+        memcpy(mappedPubkeys, host_pubkeys, pubkeys_size);
 
-        err = clEnqueueWriteBuffer(queue, d_pubkeys, CL_TRUE, 0, pubkeys_size, host_pubkeys, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            printf("Failed to enqueue write buffer (pubkeys): err %d\n", err);
-            break;
-        }
+        int init_result = -1;
+        memcpy(mappedResult, &init_result, sizeof(int));
 
-        int result_index = -1;
-        err = clEnqueueWriteBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            printf("Failed to enqueue write buffer (result): err %d\n", err);
-            break;
-        }
+        VkSubmitInfo submitInfo = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer
+        };
+        VK_CHECK(vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(computeQueue));
 
-        size_t global_work_size = BATCH_SIZE;
-        size_t local_work_size = 256; // Standard sensible local size
-
-        // Ensure global size is a multiple of local size
-        if (global_work_size % local_work_size != 0) {
-            global_work_size = (global_work_size / local_work_size + 1) * local_work_size;
-        }
-
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, &local_work_size, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            printf("Failed to enqueue NDRangeKernel: err %d\n", err);
-            break;
-        }
-
-        err = clEnqueueReadBuffer(queue, d_result, CL_TRUE, 0, sizeof(int), &result_index, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            printf("Failed to enqueue read buffer (result): err %d\n", err);
-            break;
-        }
+        int result_index;
+        memcpy(&result_index, mappedResult, sizeof(int));
 
         total_checked += BATCH_SIZE;
         if (total_checked % (BATCH_SIZE * 10) == 0) {
@@ -268,7 +377,6 @@ int main(int argc, char** argv) {
 
             unsigned char* secret = &host_secrets[result_index * 32];
 
-            // Create tor hs directory structure
             char path[512];
             if (snprintf(path, sizeof(path), "%s/%s_keys", out_dir, prefix) >= (int)sizeof(path)) {
                 printf("Output path too long.\n");
@@ -276,7 +384,7 @@ int main(int argc, char** argv) {
             }
             mkdir(path, 0700);
 
-            char key_path[550]; // Ensuring enough space for path + filename
+            char key_path[550];
             if (snprintf(key_path, sizeof(key_path), "%s/hs_ed25519_secret_key", path) >= (int)sizeof(key_path)) {
                 printf("Key path too long.\n");
                 break;
@@ -284,7 +392,6 @@ int main(int argc, char** argv) {
 
             FILE* f = fopen(key_path, "wb");
             if (f) {
-                // Tor secret key format: "== ed25519v1-secret: type0 ==\0\0\0" (32 bytes) + 64 bytes of expanded key
                 char header[32] = "== ed25519v1-secret: type0 ==\0\0\0";
                 fwrite(header, 1, 32, f);
 
@@ -304,16 +411,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    vkUnmapMemory(device, pubkeysMemory);
+    vkUnmapMemory(device, resultMemory);
+
+    // Cleanup
     free(host_pubkeys);
     free(host_secrets);
-    free(source);
-    clReleaseMemObject(d_pubkeys);
-    clReleaseMemObject(d_prefix);
-    clReleaseMemObject(d_result);
-    clReleaseKernel(kernel);
-    clReleaseProgram(prog);
-    clReleaseCommandQueue(queue);
-    clReleaseContext(ctx);
+
+    vkDestroyCommandPool(device, commandPool, NULL);
+    vkDestroyDescriptorPool(device, descriptorPool, NULL);
+    vkDestroyPipeline(device, computePipeline, NULL);
+    vkDestroyPipelineLayout(device, pipelineLayout, NULL);
+    vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
+    vkDestroyShaderModule(device, computeShaderModule, NULL);
+
+    vkDestroyBuffer(device, pubkeysBuffer, NULL);
+    vkFreeMemory(device, pubkeysMemory, NULL);
+    vkDestroyBuffer(device, prefixBuffer, NULL);
+    vkFreeMemory(device, prefixMemory, NULL);
+    vkDestroyBuffer(device, resultBuffer, NULL);
+    vkFreeMemory(device, resultMemory, NULL);
+
+    vkDestroyDevice(device, NULL);
+    vkDestroyInstance(instance, NULL);
 
     return 0;
 }

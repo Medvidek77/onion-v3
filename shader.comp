@@ -1,0 +1,204 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BasePubkeys {
+    uint8_t base_pubkeys[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer TargetPrefix {
+    uint8_t target_prefix[];
+};
+
+layout(std430, set = 0, binding = 2) buffer ResultBuffer {
+    int result_index;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint prefix_len;
+} pc;
+
+const uint64_t keccakf_rndc[24] = uint64_t[24](
+    0x0000000000000001ul, 0x0000000000008082ul, 0x800000000000808aul,
+    0x8000000080008000ul, 0x000000000000808bul, 0x0000000080000001ul,
+    0x8000000080008081ul, 0x8000000000008009ul, 0x000000000000008aul,
+    0x0000000000000088ul, 0x0000000080008009ul, 0x000000008000000aul,
+    0x000000008000808bul, 0x800000000000008bul, 0x8000000000008089ul,
+    0x8000000000008003ul, 0x8000000000008002ul, 0x8000000000000080ul,
+    0x000000000000800aul, 0x800000008000000aul, 0x8000000080008081ul,
+    0x8000000000008080ul, 0x0000000080000001ul, 0x8000000080008008ul
+);
+
+uint64_t ROL64(uint64_t a, uint offset) {
+    if (offset == 0) return a;
+    return (a << offset) ^ (a >> (64u - offset));
+}
+
+void keccakf(inout uint64_t st[25]) {
+    int round;
+    uint64_t t, bc[5];
+    for (round = 0; round < 24; ++round) {
+        // Theta
+        bc[0] = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
+        bc[1] = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
+        bc[2] = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
+        bc[3] = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
+        bc[4] = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
+
+        t = bc[4] ^ ROL64(bc[1], 1); st[0] ^= t; st[5] ^= t; st[10] ^= t; st[15] ^= t; st[20] ^= t;
+        t = bc[0] ^ ROL64(bc[2], 1); st[1] ^= t; st[6] ^= t; st[11] ^= t; st[16] ^= t; st[21] ^= t;
+        t = bc[1] ^ ROL64(bc[3], 1); st[2] ^= t; st[7] ^= t; st[12] ^= t; st[17] ^= t; st[22] ^= t;
+        t = bc[2] ^ ROL64(bc[4], 1); st[3] ^= t; st[8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t;
+        t = bc[3] ^ ROL64(bc[0], 1); st[4] ^= t; st[9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t;
+
+        // Rho Pi
+        t = st[1];
+        bc[0] = st[10]; st[10] = ROL64(t, 1); t = bc[0];
+        bc[0] = st[7]; st[7] = ROL64(t, 3); t = bc[0];
+        bc[0] = st[11]; st[11] = ROL64(t, 6); t = bc[0];
+        bc[0] = st[17]; st[17] = ROL64(t, 10); t = bc[0];
+        bc[0] = st[18]; st[18] = ROL64(t, 15); t = bc[0];
+        bc[0] = st[3]; st[3] = ROL64(t, 21); t = bc[0];
+        bc[0] = st[5]; st[5] = ROL64(t, 28); t = bc[0];
+        bc[0] = st[16]; st[16] = ROL64(t, 36); t = bc[0];
+        bc[0] = st[8]; st[8] = ROL64(t, 45); t = bc[0];
+        bc[0] = st[21]; st[21] = ROL64(t, 55); t = bc[0];
+        bc[0] = st[24]; st[24] = ROL64(t, 2); t = bc[0];
+        bc[0] = st[4]; st[4] = ROL64(t, 14); t = bc[0];
+        bc[0] = st[15]; st[15] = ROL64(t, 27); t = bc[0];
+        bc[0] = st[23]; st[23] = ROL64(t, 41); t = bc[0];
+        bc[0] = st[19]; st[19] = ROL64(t, 56); t = bc[0];
+        bc[0] = st[13]; st[13] = ROL64(t, 8); t = bc[0];
+        bc[0] = st[12]; st[12] = ROL64(t, 25); t = bc[0];
+        bc[0] = st[2]; st[2] = ROL64(t, 43); t = bc[0];
+        bc[0] = st[20]; st[20] = ROL64(t, 62); t = bc[0];
+        bc[0] = st[14]; st[14] = ROL64(t, 18); t = bc[0];
+        bc[0] = st[22]; st[22] = ROL64(t, 39); t = bc[0];
+        bc[0] = st[9]; st[9] = ROL64(t, 61); t = bc[0];
+        bc[0] = st[6]; st[6] = ROL64(t, 20); t = bc[0];
+        st[1] = ROL64(t, 44);
+
+        // Chi
+        bc[0] = st[0]; bc[1] = st[1]; bc[2] = st[2]; bc[3] = st[3]; bc[4] = st[4];
+        st[0] = bc[0] ^ (~bc[1] & bc[2]); st[1] = bc[1] ^ (~bc[2] & bc[3]); st[2] = bc[2] ^ (~bc[3] & bc[4]); st[3] = bc[3] ^ (~bc[4] & bc[0]); st[4] = bc[4] ^ (~bc[0] & bc[1]);
+        bc[0] = st[5]; bc[1] = st[6]; bc[2] = st[7]; bc[3] = st[8]; bc[4] = st[9];
+        st[5] = bc[0] ^ (~bc[1] & bc[2]); st[6] = bc[1] ^ (~bc[2] & bc[3]); st[7] = bc[2] ^ (~bc[3] & bc[4]); st[8] = bc[3] ^ (~bc[4] & bc[0]); st[9] = bc[4] ^ (~bc[0] & bc[1]);
+        bc[0] = st[10]; bc[1] = st[11]; bc[2] = st[12]; bc[3] = st[13]; bc[4] = st[14];
+        st[10] = bc[0] ^ (~bc[1] & bc[2]); st[11] = bc[1] ^ (~bc[2] & bc[3]); st[12] = bc[2] ^ (~bc[3] & bc[4]); st[13] = bc[3] ^ (~bc[4] & bc[0]); st[14] = bc[4] ^ (~bc[0] & bc[1]);
+        bc[0] = st[15]; bc[1] = st[16]; bc[2] = st[17]; bc[3] = st[18]; bc[4] = st[19];
+        st[15] = bc[0] ^ (~bc[1] & bc[2]); st[16] = bc[1] ^ (~bc[2] & bc[3]); st[17] = bc[2] ^ (~bc[3] & bc[4]); st[18] = bc[3] ^ (~bc[4] & bc[0]); st[19] = bc[4] ^ (~bc[0] & bc[1]);
+        bc[0] = st[20]; bc[1] = st[21]; bc[2] = st[22]; bc[3] = st[23]; bc[4] = st[24];
+        st[20] = bc[0] ^ (~bc[1] & bc[2]); st[21] = bc[1] ^ (~bc[2] & bc[3]); st[22] = bc[2] ^ (~bc[3] & bc[4]); st[23] = bc[3] ^ (~bc[4] & bc[0]); st[24] = bc[4] ^ (~bc[0] & bc[1]);
+
+        // Iota
+        st[0] ^= keccakf_rndc[round];
+    }
+}
+
+const uint8_t b32_alphabet[32] = uint8_t[32](
+    uint8_t(97), uint8_t(98), uint8_t(99), uint8_t(100), uint8_t(101), uint8_t(102), uint8_t(103), uint8_t(104),
+    uint8_t(105), uint8_t(106), uint8_t(107), uint8_t(108), uint8_t(109), uint8_t(110), uint8_t(111), uint8_t(112),
+    uint8_t(113), uint8_t(114), uint8_t(115), uint8_t(116), uint8_t(117), uint8_t(118), uint8_t(119), uint8_t(120),
+    uint8_t(121), uint8_t(122), uint8_t(50), uint8_t(51), uint8_t(52), uint8_t(53), uint8_t(54), uint8_t(55)
+);
+const uint8_t onion_prefix[15] = uint8_t[15](
+    uint8_t(46), uint8_t(111), uint8_t(110), uint8_t(105), uint8_t(111), uint8_t(110), uint8_t(32),
+    uint8_t(99), uint8_t(104), uint8_t(101), uint8_t(99), uint8_t(107), uint8_t(115), uint8_t(117), uint8_t(109)
+);
+
+// We emulate uint8_t access in the state by accessing the 64-bit uint array.
+// GLSL has endianness to consider, but typically Vulkan buffers map cleanly.
+// We pack bytes into uint64_t manually to avoid alignment/endianness headaches.
+uint64_t pack_bytes(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5, uint8_t b6, uint8_t b7) {
+    return uint64_t(b0) | (uint64_t(b1) << 8) | (uint64_t(b2) << 16) | (uint64_t(b3) << 24) |
+           (uint64_t(b4) << 32) | (uint64_t(b5) << 40) | (uint64_t(b6) << 48) | (uint64_t(b7) << 56);
+}
+
+void pubkey_to_base32_prefix(uint id_offset, out uint8_t out_prefix[16], uint len) {
+    uint64_t state[25];
+    for (int i=0; i<25; i++) state[i] = 0ul;
+
+    // Fill the first 48 bytes into the 64-bit state array manually.
+    // 15 bytes ".onion checksum"
+    // 32 bytes pubkey
+    // 1 byte version (0x03)
+
+    // state[0]: prefix[0..7]
+    state[0] = pack_bytes(onion_prefix[0], onion_prefix[1], onion_prefix[2], onion_prefix[3],
+                          onion_prefix[4], onion_prefix[5], onion_prefix[6], onion_prefix[7]);
+    // state[1]: prefix[8..14] + pubkey[0]
+    state[1] = pack_bytes(onion_prefix[8], onion_prefix[9], onion_prefix[10], onion_prefix[11],
+                          onion_prefix[12], onion_prefix[13], onion_prefix[14], base_pubkeys[id_offset + 0]);
+    // state[2]: pubkey[1..8]
+    state[2] = pack_bytes(base_pubkeys[id_offset + 1], base_pubkeys[id_offset + 2], base_pubkeys[id_offset + 3], base_pubkeys[id_offset + 4],
+                          base_pubkeys[id_offset + 5], base_pubkeys[id_offset + 6], base_pubkeys[id_offset + 7], base_pubkeys[id_offset + 8]);
+    // state[3]: pubkey[9..16]
+    state[3] = pack_bytes(base_pubkeys[id_offset + 9], base_pubkeys[id_offset + 10], base_pubkeys[id_offset + 11], base_pubkeys[id_offset + 12],
+                          base_pubkeys[id_offset + 13], base_pubkeys[id_offset + 14], base_pubkeys[id_offset + 15], base_pubkeys[id_offset + 16]);
+    // state[4]: pubkey[17..24]
+    state[4] = pack_bytes(base_pubkeys[id_offset + 17], base_pubkeys[id_offset + 18], base_pubkeys[id_offset + 19], base_pubkeys[id_offset + 20],
+                          base_pubkeys[id_offset + 21], base_pubkeys[id_offset + 22], base_pubkeys[id_offset + 23], base_pubkeys[id_offset + 24]);
+    // state[5]: pubkey[25..31] + version
+    state[5] = pack_bytes(base_pubkeys[id_offset + 25], base_pubkeys[id_offset + 26], base_pubkeys[id_offset + 27], base_pubkeys[id_offset + 28],
+                          base_pubkeys[id_offset + 29], base_pubkeys[id_offset + 30], base_pubkeys[id_offset + 31], uint8_t(0x03));
+
+    // Padding
+    // state[6]: byte 48 = 0x06
+    state[6] = pack_bytes(uint8_t(0x06), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0), uint8_t(0));
+    // state[16]: byte 135 = 0x80 (135/8 = 16.875 -> state[16] byte 7)
+    state[16] = uint64_t(0x80) << 56;
+
+    keccakf(state);
+
+    // Checksum is the first 2 bytes of state[0]
+    uint8_t chk0 = uint8_t(state[0] & 0xFFul);
+    uint8_t chk1 = uint8_t((state[0] >> 8) & 0xFFul);
+
+    // Build full data: 32 byte pubkey + 2 byte checksum + 1 byte version = 35 bytes
+    uint8_t full_data[35];
+    for (int i=0; i<32; i++) full_data[i] = base_pubkeys[id_offset + i];
+    full_data[32] = chk0;
+    full_data[33] = chk1;
+    full_data[34] = uint8_t(0x03);
+
+    int bit_offset = 0;
+    for(int i=0; i<len; ++i) {
+        int byte_index = bit_offset / 8;
+        int bit_shift = bit_offset % 8;
+
+        uint val = uint(full_data[byte_index]);
+        if (byte_index + 1 < 35) {
+            val |= (uint(full_data[byte_index+1]) << 8);
+        }
+
+        out_prefix[i] = b32_alphabet[(val >> bit_shift) & 31u];
+        bit_offset += 5;
+    }
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.batch_size) return;
+
+    uint id_offset = id * 32u;
+
+    uint8_t generated_prefix[16];
+    pubkey_to_base32_prefix(id_offset, generated_prefix, pc.prefix_len);
+
+    bool match = true;
+    for (uint i = 0; i < pc.prefix_len; ++i) {
+        if (generated_prefix[i] != target_prefix[i]) {
+            match = false;
+            break;
+        }
+    }
+
+    if (match) {
+        atomicCompSwap(result_index, -1, int(id));
+    }
+}

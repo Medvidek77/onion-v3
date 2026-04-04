@@ -1,3 +1,5 @@
 *.o
+*.spv
+tor_vanity_vk
 tor_vanity_ocl
 test_run
