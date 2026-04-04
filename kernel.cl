@@ -79,9 +79,13 @@ inline void keccakf(uint64_t st[25]) {
     }
 }
 
+__constant char b32_alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+__constant char onion_prefix[] = ".onion checksum";
+
 // Convert 32-byte public key to first few chars of base32
 inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len) {
-    uint8_t state[25 * 8] = {0};
+    uint64_t state[25] = {0};
+    uint8_t* state_bytes = (uint8_t*)state;
 
     // TOR v3 onion address format:
     // checksum = sha3_256(".onion checksum" || pubkey || version)
@@ -89,25 +93,24 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
 
     // Construct the input for sha3_256
     // ".onion checksum" (15 bytes)
-    __constant char prefix[] = ".onion checksum";
-    for(int i=0; i<15; ++i) state[i] = prefix[i];
+    for(int i=0; i<15; ++i) state_bytes[i] = onion_prefix[i];
     // pubkey (32 bytes)
-    for(int i=0; i<32; ++i) state[15+i] = pubkey[i];
+    for(int i=0; i<32; ++i) state_bytes[15+i] = pubkey[i];
     // version (1 byte, 0x03)
-    state[47] = 0x03;
+    state_bytes[47] = 0x03;
 
     // Keccak state padding (SHA3-256 uses 136 bytes rate)
-    state[48] = 0x06;
-    state[135] |= 0x80;
+    state_bytes[48] = 0x06;
+    state_bytes[135] |= 0x80;
 
     // Endianness adjustment before keccakf
     // OpenCL usually uses little endian, which is correct for Keccak.
-    keccakf((uint64_t*)state);
+    keccakf(state);
 
     // The checksum is the first 2 bytes of the state.
     uint8_t checksum[2];
-    checksum[0] = state[0];
-    checksum[1] = state[1];
+    checksum[0] = state_bytes[0];
+    checksum[1] = state_bytes[1];
 
     // Now encode base32 (pubkey || checksum || version)
     // Only need the first 'len' characters (up to 32 usually)
@@ -117,8 +120,6 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
     full_data[33] = checksum[1];
     full_data[34] = 0x03;
 
-    __constant char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
-
     int bit_offset = 0;
     for(int i=0; i<len; ++i) {
         int byte_index = bit_offset / 8;
@@ -127,7 +128,7 @@ inline void pubkey_to_base32_prefix(const uint8_t* pubkey, uint8_t* out, int len
         uint32_t val = full_data[byte_index];
         if (byte_index + 1 < 35) val |= (full_data[byte_index+1] << 8);
 
-        out[i] = alphabet[(val >> bit_shift) & 31];
+        out[i] = b32_alphabet[(val >> bit_shift) & 31];
         bit_offset += 5;
     }
 }
