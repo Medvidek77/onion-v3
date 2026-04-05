@@ -609,27 +609,66 @@ int main(int argc, char** argv) {
             unsigned char match_pubkey[32];
             ge_p3_tobytes(match_pubkey, &match_p3);
 
-            // Compute the checksum and build the full onion string
-            unsigned char checksum_input[48];
+            // Compute the checksum and build the full onion string using pure SHA3-256
+            unsigned char checksum_input[50];
             memcpy(checksum_input, ".onion checksum", 15);
             memcpy(checksum_input + 15, match_pubkey, 32);
             checksum_input[47] = 0x03;
-            unsigned char checksum[32];
-            crypto_generichash(checksum, 32, checksum_input, 48, NULL, 0); // SHA3 equivalent via libsodium blake2b or similar
 
-            // In place of an exact pure-sha3 encoder on host, we can reconstruct the full onion
-            // We know the prefix matches, but we want to display the full string like mkp224o.
-            // But we don't have SHA3 on the CPU easily accessible right now without dragging a library.
-            // We can just print the success folder output cleanly without overwriting the H/s meter.
+            // Minimal Keccak-f[1600] / SHA3-256
+            uint64_t state[25] = {0};
+            for (int i = 0; i < 48; i++) ((uint8_t*)state)[i] ^= checksum_input[i];
+            ((uint8_t*)state)[48] ^= 0x06;
+            ((uint8_t*)state)[135] ^= 0x80;
+
+            // Keccak-f[1600] rounds
+            const uint64_t RC[24] = {
+                0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
+                0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+                0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+                0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+                0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
+                0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
+            };
+            for (int r = 0; r < 24; r++) {
+                uint64_t C[5], D[5];
+                for (int i = 0; i < 5; i++) C[i] = state[i] ^ state[i+5] ^ state[i+10] ^ state[i+15] ^ state[i+20];
+                for (int i = 0; i < 5; i++) D[i] = C[(i+4)%5] ^ ((C[(i+1)%5] << 1) | (C[(i+1)%5] >> 63));
+                for (int i = 0; i < 25; i++) state[i] ^= D[i%5];
+                uint64_t x = 1, y = 0, current = state[1];
+                for (int i = 0; i < 24; i++) {
+                    uint64_t next_y = (2*x + 3*y) % 5;
+                    x = y; y = next_y;
+                    uint64_t shift = ((i+1)*(i+2)/2) % 64;
+                    uint64_t temp = state[x + 5*y];
+                    state[x + 5*y] = (current << shift) | (current >> (64-shift));
+                    current = temp;
+                }
+                for (int j = 0; j < 25; j += 5) {
+                    uint64_t T[5];
+                    for (int i = 0; i < 5; i++) T[i] = state[j+i];
+                    for (int i = 0; i < 5; i++) state[j+i] = T[i] ^ ((~T[(i+1)%5]) & T[(i+2)%5]);
+                }
+                state[0] ^= RC[r];
+            }
+            unsigned char checksum[2];
+            checksum[0] = ((uint8_t*)state)[0];
+            checksum[1] = ((uint8_t*)state)[1];
+
+            unsigned char full_pubkey[35];
+            memcpy(full_pubkey, match_pubkey, 32);
+            full_pubkey[32] = checksum[0];
+            full_pubkey[33] = checksum[1];
+            full_pubkey[34] = 0x03;
 
             char b32_alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
-            char pubkey_b32[54] = {0};
+            char pubkey_b32[57] = {0};
             int bit_offset = 0;
-            for (int i = 0; i < 52; ++i) {
+            for (int i = 0; i < 56; ++i) {
                 int bidx = bit_offset / 8;
                 int bsft = bit_offset % 8;
-                uint32_t val = match_pubkey[bidx] << 8;
-                if (bidx + 1 < 32) val |= match_pubkey[bidx + 1];
+                uint32_t val = full_pubkey[bidx] << 8;
+                if (bidx + 1 < 35) val |= full_pubkey[bidx + 1];
                 uint32_t shift = 11u - bsft;
                 pubkey_b32[i] = b32_alphabet[(val >> shift) & 31];
                 bit_offset += 5;
@@ -657,7 +696,7 @@ int main(int argc, char** argv) {
                 fclose(f);
 
                 if (!print_stats) {
-                    printf("%s...(checksum_hidden).onion\n", pubkey_b32);
+                    printf("%s.onion\n", pubkey_b32);
                     fflush(stdout);
                 }
             }
