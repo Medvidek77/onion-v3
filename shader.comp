@@ -6,6 +6,9 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+shared int shared_z[64][10];
+shared int shared_prods[64][10];
+
 struct ge_p3 {
     int X[10];
     int Y[10];
@@ -35,25 +38,16 @@ layout(std430, set = 0, binding = 1) readonly buffer OffsetPoints {
     ge_cached offsets[];
 };
 
-layout(std430, set = 0, binding = 2) readonly buffer TargetPrefix {
-    uint8_t target_prefix[];
-};
-
-layout(std430, set = 0, binding = 3) buffer ResultBuffer {
+layout(std430, set = 0, binding = 2) buffer ResultBuffer {
     int result_index;
 };
 
 layout(push_constant) uniform PushConstants {
     uint batch_size;
-    uint prefix_len;
+    uint valid_bytes;
+    uint8_t byte_target[16];
+    uint8_t byte_mask[16];
 } pc;
-
-const uint8_t b32_alphabet[32] = uint8_t[32](
-    uint8_t(97), uint8_t(98), uint8_t(99), uint8_t(100), uint8_t(101), uint8_t(102), uint8_t(103), uint8_t(104),
-    uint8_t(105), uint8_t(106), uint8_t(107), uint8_t(108), uint8_t(109), uint8_t(110), uint8_t(111), uint8_t(112),
-    uint8_t(113), uint8_t(114), uint8_t(115), uint8_t(116), uint8_t(117), uint8_t(118), uint8_t(119), uint8_t(120),
-    uint8_t(121), uint8_t(122), uint8_t(50), uint8_t(51), uint8_t(52), uint8_t(53), uint8_t(54), uint8_t(55)
-);
 
 // ==== ED25519 FIELD MATH IN GLSL ====
 void fe_add(out int h[10], in int f[10], in int g[10]) {
@@ -321,9 +315,7 @@ void fe_tobytes(out uint8_t s[32], in int h[10]) {
     s[28] = uint8_t((h8 >> 19) | (h9 << 6)); s[29] = uint8_t(h9 >> 2); s[30] = uint8_t(h9 >> 10); s[31] = uint8_t(h9 >> 18);
 }
 
-void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10]) {
-    int recip[10];
-    fe_invert(recip, Z);
+void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int recip[10]) {
     int x[10], y[10];
     fe_mul(x, X, recip);
     fe_mul(y, Y, recip);
@@ -367,39 +359,39 @@ void main() {
                     base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
                     offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
-    uint8_t final_pubkey[32];
-    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z);
+    uint lid = gl_LocalInvocationID.x;
+    for (int i=0; i<10; i++) shared_z[lid][i] = R_Z[i];
+    barrier();
 
-    // FAST PATH: Check the public key directly against the target prefix WITHOUT Keccak
-    // Since base32 uses 5 bits per character, 16 characters = 80 bits = 10 bytes.
-    // The Tor v3 format hashes `.onion checksum || pubkey || 0x03`. But the .onion string
-    // starts directly with `base32(pubkey)`. So if prefix_len <= 16, we only check `pubkey`!
+    // Proper Montgomery batch inversion in LDS for 64 threads
+    if (lid == 0) {
+        for (int i=0; i<10; i++) shared_prods[0][i] = shared_z[0][i];
+        for (int i=1; i<64; i++) {
+            fe_mul(shared_prods[i], shared_prods[i-1], shared_z[i]);
+        }
 
-    uint8_t fast_prefix[16];
-    int bit_offset = 0;
-    for (int i = 0; i < int(pc.prefix_len); ++i) {
-        int bidx  = bit_offset / 8;
-        int bsft  = bit_offset % 8;
+        int inv[10];
+        fe_invert(inv, shared_prods[63]);
 
-        // Tor uses RFC 4648 Base32 which extracts bits MSB-first (left-to-right).
-        // For a 5-bit chunk at bit_offset starting at bidx:
-        // We load a 16-bit sliding window starting from bidx (Big-Endian).
-        uint val = (uint(final_pubkey[bidx]) << 8);
-        if (bidx + 1 < 32) val |= uint(final_pubkey[bidx + 1]);
-
-        // We shift the window down so the 5 bits we want are at the bottom.
-        // The leftmost bit of the 16-bit window is bit 0 of the first byte (MSB).
-        // We want the 5 bits starting at bit offset bsft.
-        // The total bits in our window to the right of our target 5-bit block is: 16 - bsft - 5 = 11 - bsft.
-        uint shift = 11u - uint(bsft);
-
-        fast_prefix[i] = b32_alphabet[(val >> shift) & 31u];
-        bit_offset += 5;
+        for (int i=63; i>0; i--) {
+            int cur_z[10];
+            for (int j=0; j<10; j++) cur_z[j] = shared_z[i][j];
+            fe_mul(shared_z[i], inv, shared_prods[i-1]);
+            fe_mul(inv, inv, cur_z);
+        }
+        for (int j=0; j<10; j++) shared_z[0][j] = inv[j];
     }
+    barrier();
+
+    int recip[10];
+    for (int i=0; i<10; i++) recip[i] = shared_z[lid][i];
+
+    uint8_t final_pubkey[32];
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
 
     bool match = true;
-    for (uint i = 0; i < pc.prefix_len; ++i) {
-        if (fast_prefix[i] != target_prefix[i]) {
+    for (uint i = 0; i < pc.valid_bytes; ++i) {
+        if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
             match = false;
             break;
         }

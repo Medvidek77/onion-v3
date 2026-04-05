@@ -305,41 +305,109 @@ int main(int argc, char** argv) {
         vkBindBufferMemory(device, basepointBuffer[i], basepointMemory[i], 0);
     }
 
-    // Offsets buffer
+    // Transfer Command Pool
+    VkCommandPoolCreateInfo cmdPoolInfoTrans = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = computeFamily,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    };
+    VkCommandPool transferPool;
+    VK_CHECK(vkCreateCommandPool(device, &cmdPoolInfoTrans, NULL, &transferPool));
+
+    // Offsets buffer (Staging -> Device Local)
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingMemory;
     bufferInfo.size = offsets_size;
-    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &stagingBuffer));
+    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &stagingMemory));
+    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+
+    void* stagingData;
+    vkMapMemory(device, stagingMemory, 0, offsets_size, 0, &stagingData);
+    memcpy(stagingData, host_offsets, offsets_size);
+    vkUnmapMemory(device, stagingMemory);
+
     VkBuffer offsetsBuffer;
+    VkDeviceMemory offsetsMemory;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &offsetsBuffer));
     vkGetBufferMemoryRequirements(device, offsetsBuffer, &memReqs);
     allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory offsetsMemory;
+
+    // Try DEVICE_LOCAL. If it fails (e.g. llvmpipe without dedicated memory), fall back to HOST_VISIBLE.
+    uint32_t memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memTypeIndex == (uint32_t)-1) {
+        memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    allocInfo.memoryTypeIndex = memTypeIndex;
     VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &offsetsMemory));
     vkBindBufferMemory(device, offsetsBuffer, offsetsMemory, 0);
 
-    // Write Offsets once
-    void* mappedOffsets;
-    vkMapMemory(device, offsetsMemory, 0, offsets_size, 0, &mappedOffsets);
-    memcpy(mappedOffsets, host_offsets, offsets_size);
-    vkUnmapMemory(device, offsetsMemory);
+    VkCommandBufferAllocateInfo allocTransferInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = transferPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer transferCmd;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocTransferInfo, &transferCmd));
 
-    // Prefix buffer
-    bufferInfo.size = prefix_len;
-    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    VkBuffer prefixBuffer;
-    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &prefixBuffer));
-    vkGetBufferMemoryRequirements(device, prefixBuffer, &memReqs);
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory prefixMemory;
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &prefixMemory));
-    vkBindBufferMemory(device, prefixBuffer, prefixMemory, 0);
+    VkCommandBufferBeginInfo beginTransferInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(transferCmd, &beginTransferInfo);
+    VkBufferCopy copyRegion = { .srcOffset = 0, .dstOffset = 0, .size = offsets_size };
+    vkCmdCopyBuffer(transferCmd, stagingBuffer, offsetsBuffer, 1, &copyRegion);
+    vkEndCommandBuffer(transferCmd);
 
-    // Write prefix once
-    void* mappedPrefix;
-    vkMapMemory(device, prefixMemory, 0, prefix_len, 0, &mappedPrefix);
-    memcpy(mappedPrefix, prefix, prefix_len);
-    vkUnmapMemory(device, prefixMemory);
+    VkSubmitInfo submitInfo = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &transferCmd };
+    vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(computeQueue);
+
+    vkFreeCommandBuffers(device, transferPool, 1, &transferCmd);
+    vkDestroyCommandPool(device, transferPool, NULL);
+    vkDestroyBuffer(device, stagingBuffer, NULL);
+    vkFreeMemory(device, stagingMemory, NULL);
+
+    // Prefix Bitmask (No GPU buffer needed, using push constants)
+    uint8_t byte_target[16] = {0};
+    uint8_t byte_mask[16] = {0};
+    uint32_t total_bits = prefix_len * 5;
+    uint32_t full_bytes = total_bits / 8;
+    uint32_t remainder_bits = total_bits % 8;
+
+    uint8_t bits[256] = {0};
+    for (size_t i = 0; i < prefix_len; i++) {
+        int val = 0;
+        char c = prefix[i];
+        if (c >= 'a' && c <= 'z') val = c - 'a';
+        else if (c >= '2' && c <= '7') val = c - '2' + 26;
+        for (int b = 4; b >= 0; b--) {
+            bits[i * 5 + (4 - b)] = (val >> b) & 1;
+        }
+    }
+
+    uint32_t valid_bytes = full_bytes;
+    for (uint32_t i = 0; i < full_bytes; i++) {
+        for (int b = 0; b < 8; b++) {
+            byte_target[i] |= bits[i * 8 + b] << (7 - b);
+        }
+        byte_mask[i] = 0xFF;
+    }
+
+    if (remainder_bits > 0) {
+        uint8_t partial_target = 0;
+        uint8_t partial_mask = 0;
+        for (uint32_t b = 0; b < remainder_bits; b++) {
+            partial_target |= bits[full_bytes * 8 + b] << (7 - b);
+            partial_mask |= 1 << (7 - b);
+        }
+        byte_target[full_bytes] = partial_target;
+        byte_mask[full_bytes] = partial_mask;
+        valid_bytes++;
+    }
 
     // Result buffer (Double Buffered)
     bufferInfo.size = result_size;
@@ -383,25 +451,37 @@ int main(int argc, char** argv) {
     free(shaderCode);
 
     // Descriptor set layout
-    VkDescriptorSetLayoutBinding bindings[4] = {
+    VkDescriptorSetLayoutBinding bindings[3] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 4,
+        .bindingCount = 3,
         .pBindings = bindings
     };
     VkDescriptorSetLayout descriptorSetLayout;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &descriptorSetLayout));
 
+    typedef struct {
+        uint32_t batch_size;
+        uint32_t valid_bytes;
+        uint8_t  byte_target[16];
+        uint8_t  byte_mask[16];
+    } PushConstants;
+
+    PushConstants pc_data = {0};
+    pc_data.batch_size = BATCH_SIZE;
+    pc_data.valid_bytes = valid_bytes;
+    memcpy(pc_data.byte_target, byte_target, 16);
+    memcpy(pc_data.byte_mask, byte_mask, 16);
+
     // Pipeline Layout
     VkPushConstantRange pushConstantRange = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
-        .size = sizeof(uint32_t) * 2 // batch_size and prefix_len
+        .size = sizeof(PushConstants)
     };
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
@@ -450,20 +530,18 @@ int main(int argc, char** argv) {
     VkDescriptorSet descriptorSets[2];
     VK_CHECK(vkAllocateDescriptorSets(device, &allocSetInfo, descriptorSets));
 
-    VkDescriptorBufferInfo prefixBufInfo = { prefixBuffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo offsetBufInfo = { offsetsBuffer, 0, VK_WHOLE_SIZE };
 
     for (int i=0; i<2; i++) {
         VkDescriptorBufferInfo baseBufInfo = { basepointBuffer[i], 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo resultBufInfo = { resultBuffer[i], 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet descriptorWrites[4] = {
+        VkWriteDescriptorSet descriptorWrites[3] = {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &prefixBufInfo, NULL },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
         };
-        vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, NULL);
+        vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
     }
 
     // Command Pool & Buffers (Double Buffered)
@@ -491,8 +569,7 @@ int main(int argc, char** argv) {
         vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
         vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSets[i], 0, NULL);
 
-        uint32_t pushConstants[2] = { BATCH_SIZE, (uint32_t)prefix_len };
-        vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
+        vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
 
         vkCmdDispatch(commandBuffers[i], BATCH_SIZE / 64, 1, 1);
         VK_CHECK(vkEndCommandBuffer(commandBuffers[i]));
@@ -736,8 +813,6 @@ int main(int argc, char** argv) {
 
     vkDestroyBuffer(device, offsetsBuffer, NULL);
     vkFreeMemory(device, offsetsMemory, NULL);
-    vkDestroyBuffer(device, prefixBuffer, NULL);
-    vkFreeMemory(device, prefixMemory, NULL);
 
     vkDestroyDevice(device, NULL);
     vkDestroyInstance(instance, NULL);
