@@ -200,8 +200,9 @@ void fe_invert(out int out_fe[10], in int z[10]) {
     for(int i=1;i<20;++i) fe_sq(t3, t3);
     fe_mul(t2, t3, t2);
 
-    for(int i=0;i<10;++i) fe_sq(t2, t2);
-    fe_mul(t1, t2, t1);
+    fe_sq(t3, t2);
+    for(int i=1;i<10;++i) fe_sq(t3, t3);
+    fe_mul(t1, t3, t1);
 
     fe_sq(t2, t1);
     for(int i=1;i<50;++i) fe_sq(t2, t2);
@@ -211,8 +212,9 @@ void fe_invert(out int out_fe[10], in int z[10]) {
     for(int i=1;i<100;++i) fe_sq(t3, t3);
     fe_mul(t2, t3, t2);
 
-    for(int i=0;i<50;++i) fe_sq(t2, t2);
-    fe_mul(t1, t2, t1);
+    fe_sq(t3, t2);
+    for(int i=1;i<50;++i) fe_sq(t3, t3);
+    fe_mul(t1, t3, t1);
 
     fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1); fe_sq(t1, t1);
     fe_mul(out_fe, t1, t0);
