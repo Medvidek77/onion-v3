@@ -530,6 +530,10 @@ int main(int argc, char** argv) {
     randombytes_buf(base_secret[0], 32);
     crypto_hash_sha512(h_scalars[0], base_secret[0], 32);
     h_scalars[0][0] &= 248; h_scalars[0][31] &= 127; h_scalars[0][31] |= 64;
+
+    // We MUST reduce the scalar mod L so sc_muladd works properly later!
+    sc_reduce(h_scalars[0]);
+
     ge_p3 base_p3;
     ge_scalarmult_base(&base_p3, h_scalars[0]);
     convert_p3_to_gpu(&host_basepoint[0], &base_p3);
@@ -548,6 +552,10 @@ int main(int argc, char** argv) {
         randombytes_buf(base_secret[next_frame], 32);
         crypto_hash_sha512(h_scalars[next_frame], base_secret[next_frame], 32);
         h_scalars[next_frame][0] &= 248; h_scalars[next_frame][31] &= 127; h_scalars[next_frame][31] |= 64;
+
+        // We MUST reduce the scalar mod L so sc_muladd works properly later!
+        sc_reduce(h_scalars[next_frame]);
+
         ge_scalarmult_base(&base_p3, h_scalars[next_frame]);
         convert_p3_to_gpu(&host_basepoint[next_frame], &base_p3);
         memcpy(mappedBasepoint[next_frame], &host_basepoint[next_frame], basepoint_size);
@@ -577,6 +585,7 @@ int main(int argc, char** argv) {
         }
 
         if (result_index != -1) {
+            printf("RESULT_INDEX: %d\n", result_index);
             found_count++;
             unsigned char* h = h_scalars[cur_frame];
             // To get the actual secret, we take our base scalar `h`
