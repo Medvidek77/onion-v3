@@ -653,12 +653,14 @@ int main(int argc, char** argv) {
 
         total_checked += BATCH_SIZE;
 
-        double current_time = get_time_sec();
-        if (print_stats && current_time - last_print_time >= 1.0) {
-            double hps = total_checked / (current_time - start_time);
-            printf("\rChecked %lu keys | %.2f H/s | Found: %u    ", total_checked, hps, found_count);
-            fflush(stdout);
-            last_print_time = current_time;
+        if (print_stats) {
+            double current_time = get_time_sec();
+            if (current_time - last_print_time >= 1.0) {
+                double hps = total_checked / (current_time - start_time);
+                printf("\rChecked %lu keys | %.2f H/s | Found: %u    ", total_checked, hps, found_count);
+                fflush(stdout);
+                last_print_time = current_time;
+            }
         }
 
         if (result_index != -1) {
