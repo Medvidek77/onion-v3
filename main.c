@@ -585,7 +585,6 @@ int main(int argc, char** argv) {
         }
 
         if (result_index != -1) {
-            printf("RESULT_INDEX: %d\n", result_index);
             found_count++;
             unsigned char* h = h_scalars[cur_frame];
             // To get the actual secret, we take our base scalar `h`
@@ -623,6 +622,19 @@ int main(int argc, char** argv) {
             // But we don't have SHA3 on the CPU easily accessible right now without dragging a library.
             // We can just print the success folder output cleanly without overwriting the H/s meter.
 
+            char b32_alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+            char pubkey_b32[54] = {0};
+            int bit_offset = 0;
+            for (int i = 0; i < 52; ++i) {
+                int bidx = bit_offset / 8;
+                int bsft = bit_offset % 8;
+                uint32_t val = match_pubkey[bidx] << 8;
+                if (bidx + 1 < 32) val |= match_pubkey[bidx + 1];
+                uint32_t shift = 11u - bsft;
+                pubkey_b32[i] = b32_alphabet[(val >> shift) & 31];
+                bit_offset += 5;
+            }
+
             char path[512];
             if (snprintf(path, sizeof(path), "%s/%s_keys_%u", out_dir, prefix, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
                 continue;
@@ -645,7 +657,7 @@ int main(int argc, char** argv) {
                 fclose(f);
 
                 if (!print_stats) {
-                    printf("%s\n", path);
+                    printf("%s...(checksum_hidden).onion\n", pubkey_b32);
                     fflush(stdout);
                 }
             }

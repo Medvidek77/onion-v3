@@ -357,17 +357,6 @@ void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10], 
     q = (x9 + q) >> 25;
     x0 += 19 * q;
 
-    carry0 = x0 >> 26; x1 += carry0; x0 -= carry0 << 26;
-    carry1 = x1 >> 25; x2 += carry1; x1 -= carry1 << 25;
-    carry2 = x2 >> 26; x3 += carry2; x2 -= carry2 << 26;
-    carry3 = x3 >> 25; x4 += carry3; x3 -= carry3 << 25;
-    carry4 = x4 >> 26; x5 += carry4; x4 -= carry4 << 26;
-    carry5 = x5 >> 25; x6 += carry5; x5 -= carry5 << 25;
-    carry6 = x6 >> 26; x7 += carry6; x6 -= carry6 << 26;
-    carry7 = x7 >> 25; x8 += carry7; x7 -= carry7 << 25;
-    carry8 = x8 >> 26; x9 += carry8; x8 -= carry8 << 26;
-    int carry9 = x9 >> 25; x9 -= carry9 << 25;
-
     s[31] ^= uint8_t((x0 & 1) << 7);
 }
 
