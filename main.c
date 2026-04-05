@@ -104,7 +104,8 @@ void generate_offsets(gpu_ge_cached* offsets, uint32_t count) {
     // We want offsets O[i] = i * 8 * G
     // G is the base point
     ge_p3 G, cur_p3;
-    ge_scalarmult_base(&G, (const unsigned char*)"\1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"); // G
+    const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    ge_scalarmult_base(&G, one); // G
 
     // Calculate 8*G
     ge_p1p1 p1;
@@ -589,8 +590,10 @@ int main(int argc, char** argv) {
             offset_scalar[3] = (offset_val >> 24) & 0xff;
 
             unsigned char final_scalar[32];
-            // final_scalar = offset_scalar * 1 + h
-            sc_muladd(final_scalar, offset_scalar, (const unsigned char*)"\1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", h);
+            // In orlp/ed25519 (ref10), sc_muladd(s, a, b, c) calculates s = (a * b + c) mod L
+            // We want h + offset_scalar. So a = offset_scalar, b = 1, c = h
+            const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+            sc_muladd(final_scalar, offset_scalar, one, h);
 
             // We need the matching public key to save it in Tor format
             ge_p3 match_p3;
