@@ -205,7 +205,7 @@ void main() {
 
     int R_X[10], R_Y[10], R_Z[10];
 
-    // Calculate points and prepare Z for inversion
+    // Calculate points and prepare Z for batch inversion
     if (id < pc.batch_size) {
         ge_madd_precomp(R_X, R_Y, R_Z,
                         base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
@@ -213,72 +213,86 @@ void main() {
 
         for (int i = 0; i < 10; i++) {
             shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
+            shared_S[WG_SIZE - 1u - lid][i] = R_Z[i];
         }
     } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
         for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
+            int v = (i == 0) ? 1 : 0;
+            shared_P[lid][i] = v;
+            shared_S[WG_SIZE - 1u - lid][i] = v;
         }
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
+    // 1) Upsweep reduction tree for prefix products.
+    for (uint stride = 1u; stride < WG_SIZE; stride <<= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int tmp[10];
+            fe_mul(tmp, shared_P[idx - stride], shared_P[idx]);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = tmp[i];
         }
         barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
+
+        if (idx < WG_SIZE) {
+            int tmp[10];
+            fe_mul(tmp, shared_S[idx - stride], shared_S[idx]);
+            for (int i = 0; i < 10; i++) shared_S[idx][i] = tmp[i];
         }
         barrier();
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < WG_SIZE) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 3. Last lane computes the only heavy inversion for the workgroup
-    if (lid == WG_SIZE - 1u) {
+    // 2) Invert total product once, then convert both trees to exclusive scans.
+    if (lid == 0u) {
         fe_invert(shared_total_inv, shared_P[WG_SIZE - 1u]);
+        for (int i = 0; i < 10; i++) {
+            int one = (i == 0) ? 1 : 0;
+            shared_P[WG_SIZE - 1u][i] = one;
+            shared_S[WG_SIZE - 1u][i] = one;
+        }
     }
     barrier();
 
-    // 4. Extract individual reciprocals
+    // 3) Downsweep to exclusive prefix products (Blelloch scan).
+    for (uint stride = WG_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int left[10];
+            int right[10];
+            for (int i = 0; i < 10; i++) {
+                left[i] = shared_P[idx - stride][i];
+                right[i] = shared_P[idx][i];
+                shared_P[idx - stride][i] = right[i];
+            }
+            int tmp[10];
+            fe_mul(tmp, right, left);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = tmp[i];
+        }
+        barrier();
+
+        if (idx < WG_SIZE) {
+            int left[10];
+            int right[10];
+            for (int i = 0; i < 10; i++) {
+                left[i] = shared_S[idx - stride][i];
+                right[i] = shared_S[idx][i];
+                shared_S[idx - stride][i] = right[i];
+            }
+            int tmp[10];
+            fe_mul(tmp, right, left);
+            for (int i = 0; i < 10; i++) shared_S[idx][i] = tmp[i];
+        }
+        barrier();
+    }
+
+    // 4) recip[i] = prefix_excl[i] * suffix_excl[i] * inverse(total)
     if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
-        int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
         int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
+        int suffix_excl[10];
+        for (int i = 0; i < 10; i++) suffix_excl[i] = shared_S[WG_SIZE - 1u - lid][i];
+        fe_mul(recip, shared_P[lid], suffix_excl);
         int total_inv_local[10];
         for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
         fe_mul(recip, recip, total_inv_local);
 
         uint8_t final_pubkey[32];
