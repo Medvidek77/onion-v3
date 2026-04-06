@@ -13,8 +13,9 @@
  */
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+shared int shared_Z[256][10];
 shared int shared_P[256][10];
-shared int shared_S[256][10];
+shared int shared_recip[256][10];
 shared int shared_total_inv[10];
 
 struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
@@ -211,74 +212,62 @@ void main() {
                         offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
         for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
+            shared_Z[lid][i] = R_Z[i];
         }
     } else {
         int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
         for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
+            shared_Z[lid][i] = one[i];
         }
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
-        }
-        barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
-        }
-        barrier();
-    }
+    // 1) Thread 0 performs batch inversion preparation with O(n) fe_mul
+    //    (prefix product + reverse reconstruction), which is far cheaper than
+    //    O(n log n) prefix/suffix scan in FE arithmetic.
+    if (lid == 0) {
+        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
+        int prefix[10];
+        for (int j = 0; j < 10; j++) prefix[j] = one[j];
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid + stride < 256) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
+        // Inclusive prefix products P[i] = z0*z1*...*zi
+        for (int i = 0; i < 256; i++) {
+            int tmp[10];
+            fe_mul(tmp, prefix, shared_Z[i]);
+            for (int j = 0; j < 10; j++) {
+                prefix[j] = tmp[j];
+                shared_P[i][j] = tmp[j];
+            }
         }
-        barrier();
-        if (lid + stride < 256) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
 
-    // 3. Thread 255 computes the only heavy inversion for the block
-    if (lid == 255) {
+        // Single inversion for whole block
         fe_invert(shared_total_inv, shared_P[255]);
+
+        // Reverse pass: recip[i] = (z0*...*z(i-1)) * inv(z0*...*z255)
+        int running_inv[10];
+        for (int j = 0; j < 10; j++) running_inv[j] = shared_total_inv[j];
+
+        for (int i = 255; i >= 0; i--) {
+            int prev_prefix[10];
+            if (i == 0) {
+                for (int j = 0; j < 10; j++) prev_prefix[j] = one[j];
+            } else {
+                for (int j = 0; j < 10; j++) prev_prefix[j] = shared_P[i - 1][j];
+            }
+
+            fe_mul(shared_recip[i], prev_prefix, running_inv);
+
+            int tmp[10];
+            fe_mul(tmp, running_inv, shared_Z[i]);
+            for (int j = 0; j < 10; j++) running_inv[j] = tmp[j];
+        }
     }
     barrier();
 
-    // 4. Extract individual reciprocals
+    // 2) Extract individual reciprocals
     if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
-        int S_excl[10];
-        if (lid == 255) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
         int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
+        for (int i = 0; i < 10; i++) recip[i] = shared_recip[lid][i];
 
         uint8_t final_pubkey[32];
         ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
