@@ -11,12 +11,7 @@
  *  - no shared memory, no LDS usage → frees LDS for scheduler
  *  - bitmask prefix check (already in current code)
  */
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 128u;
-
-shared int shared_P[WG_SIZE][10];
-shared int shared_S[WG_SIZE][10];
-shared int shared_total_inv[10];
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
 struct ge_cached       { int YplusX[10]; int YminusX[10]; int Z[10];  int T2d[10]; };
@@ -199,101 +194,25 @@ void ge_p3_tobytes(out uint8_t s[32],in int X[10],in int Y[10],in int recip[10])
     s[31]^=uint8_t((x0&1)<<7);
 }
 
-void main() {
-    uint id = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
+void main(){
+    uint id=gl_GlobalInvocationID.x;
+    if(id>=pc.batch_size) return;
 
-    int R_X[10], R_Y[10], R_Z[10];
+    int R_X[10],R_Y[10],R_Z[10];
+    ge_madd_precomp(R_X,R_Y,R_Z,
+                    base_point.YplusX,base_point.YminusX,base_point.Z2,base_point.T,
+                    offsets[id].YplusX,offsets[id].YminusX,offsets[id].Z,offsets[id].T2d);
 
-    // Calculate points and prepare Z for inversion
-    if (id < pc.batch_size) {
-        ge_madd_precomp(R_X, R_Y, R_Z,
-                        base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
-                        offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+    /* Every thread computes its own invert — no barrier(), no LDS, full utilization */
+    int recip[10];
+    fe_invert(recip,R_Z);
 
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
-        }
-    } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
-        }
+    uint8_t final_pubkey[32];
+    ge_p3_tobytes(final_pubkey,R_X,R_Y,recip);
+
+    bool match=true;
+    for(uint i=0;i<pc.valid_bytes;++i){
+        if((final_pubkey[i]&pc.byte_mask[i])!=pc.byte_target[i]){match=false;break;}
     }
-    barrier();
-
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
-        }
-        barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < WG_SIZE) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 3. Last lane computes the only heavy inversion for the workgroup
-    if (lid == WG_SIZE - 1u) {
-        fe_invert(shared_total_inv, shared_P[WG_SIZE - 1u]);
-    }
-    barrier();
-
-    // 4. Extract individual reciprocals
-    if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
-        int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
-        int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
-
-        uint8_t final_pubkey[32];
-        ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
-
-        bool match = true;
-        for (uint i = 0; i < pc.valid_bytes; ++i) {
-            if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
-                match = false;
-                break;
-            }
-        }
-
-        if (match) {
-            atomicCompSwap(result_index, -1, int(id));
-        }
-    }
+    if(match) atomicCompSwap(result_index,-1,int(id));
 }
