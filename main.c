@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 19) // 524,288 keys per batch (~80MB offset buffer, fits inside 128MB AMD Infinity Cache)
 #define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 // Internal CPU structs mapping directly to GPU buffers
