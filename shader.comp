@@ -224,52 +224,86 @@ void main() {
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
+    // 1) Work-efficient Blelloch exclusive scan for prefix products (shared_P).
+    // Upsweep
+    for (uint stride = 1u; stride < WG_SIZE; stride <<= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int temp[10];
+            fe_mul(temp, shared_P[idx - stride], shared_P[idx]);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = temp[i];
         }
         barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
+    }
+    // Save total product and set last element to multiplicative identity for exclusive scan.
+    if (lid == WG_SIZE - 1u) {
+        for (int i = 0; i < 10; i++) shared_total_inv[i] = shared_P[lid][i];
+        shared_P[lid][0] = 1;
+        for (int i = 1; i < 10; i++) shared_P[lid][i] = 0;
+    }
+    barrier();
+    // Downsweep
+    for (uint stride = WG_SIZE >> 1u; stride >= 1u; stride >>= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int left_old[10];
+            for (int i = 0; i < 10; i++) left_old[i] = shared_P[idx - stride][i];
+            for (int i = 0; i < 10; i++) shared_P[idx - stride][i] = shared_P[idx][i];
+            int temp[10];
+            fe_mul(temp, shared_P[idx], left_old);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = temp[i];
         }
         barrier();
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
+    // 2) Work-efficient Blelloch exclusive scan for suffix products (shared_S),
+    // by mirroring indices to scan from the right side.
+    for (uint stride = 1u; stride < WG_SIZE; stride <<= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            uint r_idx = WG_SIZE - 1u - idx;
+            uint r_prev = WG_SIZE - 1u - (idx - stride);
+            int temp[10];
+            fe_mul(temp, shared_S[r_prev], shared_S[r_idx]);
+            for (int i = 0; i < 10; i++) shared_S[r_idx][i] = temp[i];
         }
         barrier();
-        if (lid + stride < WG_SIZE) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
+    }
+    if (lid == WG_SIZE - 1u) {
+        shared_S[0][0] = 1;
+        for (int i = 1; i < 10; i++) shared_S[0][i] = 0;
+    }
+    barrier();
+    for (uint stride = WG_SIZE >> 1u; stride >= 1u; stride >>= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            uint r_idx = WG_SIZE - 1u - idx;
+            uint r_prev = WG_SIZE - 1u - (idx - stride);
+            int left_old[10];
+            for (int i = 0; i < 10; i++) left_old[i] = shared_S[r_prev][i];
+            for (int i = 0; i < 10; i++) shared_S[r_prev][i] = shared_S[r_idx][i];
+            int temp[10];
+            fe_mul(temp, shared_S[r_idx], left_old);
+            for (int i = 0; i < 10; i++) shared_S[r_idx][i] = temp[i];
         }
         barrier();
     }
 
     // 3. Last lane computes the only heavy inversion for the workgroup
     if (lid == WG_SIZE - 1u) {
-        fe_invert(shared_total_inv, shared_P[WG_SIZE - 1u]);
+        int total_product[10];
+        for (int i = 0; i < 10; i++) total_product[i] = shared_total_inv[i];
+        fe_invert(shared_total_inv, total_product);
     }
     barrier();
 
     // 4. Extract individual reciprocals
     if (id < pc.batch_size) {
         int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
         int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
+        for (int i = 0; i < 10; i++) {
+            P_excl[i] = shared_P[lid][i];
+            S_excl[i] = shared_S[lid][i];
         }
 
         // recip = P_excl * S_excl * total_inv
