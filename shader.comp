@@ -198,101 +198,91 @@ void ge_p3_tobytes(out uint8_t s[32],in int X[10],in int Y[10],in int recip[10])
     s[31]^=uint8_t((x0&1)<<7);
 }
 
+void fe_set_one(out int x[10]) {
+    x[0] = 1;
+    for (int i = 1; i < 10; ++i) x[i] = 0;
+}
+
+void fe_copy(out int dst[10], in int src[10]) {
+    for (int i = 0; i < 10; ++i) dst[i] = src[i];
+}
+
+void fe_scan_exclusive_shared(inout int data[256][10], uint lid) {
+    // Work-efficient Blelloch scan (exclusive) for multiplicative monoid.
+    for (uint stride = 1; stride < 256; stride <<= 1) {
+        uint idx = ((lid + 1u) * stride * 2u) - 1u;
+        if (idx < 256u) {
+            int tmp[10];
+            fe_mul(tmp, data[idx], data[idx - stride]);
+            fe_copy(data[idx], tmp);
+        }
+        barrier();
+    }
+
+    if (lid == 0u) fe_set_one(data[255]);
+    barrier();
+
+    for (uint stride = 128u; stride >= 1u; stride >>= 1u) {
+        uint idx = ((lid + 1u) * stride * 2u) - 1u;
+        if (idx < 256u) {
+            int left[10], right[10];
+            fe_copy(left,  data[idx - stride]);
+            fe_copy(right, data[idx]);
+            fe_copy(data[idx - stride], right);
+            fe_mul(data[idx], right, left);
+        }
+        barrier();
+        if (stride == 1u) break;
+    }
+}
+
 void main() {
     uint id = gl_GlobalInvocationID.x;
     uint lid = gl_LocalInvocationID.x;
 
     int R_X[10], R_Y[10], R_Z[10];
 
-    // Calculate points and prepare Z for inversion
-    if (id < pc.batch_size) {
-        ge_madd_precomp(R_X, R_Y, R_Z,
-                        base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
-                        offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+    // Dispatch is exact (BATCH_SIZE / 256), so all invocations are valid.
+    ge_madd_precomp(R_X, R_Y, R_Z,
+                    base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
+                    offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
-        }
-    } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
-        }
+    for (int i = 0; i < 10; i++) {
+        shared_P[lid][i] = R_Z[i];
+        shared_S[255u - lid][i] = R_Z[i];
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
-        }
-        barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
-        }
-        barrier();
-    }
+    // 1) Exclusive prefix and suffix scans (work-efficient).
+    fe_scan_exclusive_shared(shared_P, lid);
+    fe_scan_exclusive_shared(shared_S, lid);
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid + stride < 256) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < 256) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 3. Thread 255 computes the only heavy inversion for the block
+    // 2) Thread 255 computes inverse(total product) using P_excl(last) * Z_last.
     if (lid == 255) {
-        fe_invert(shared_total_inv, shared_P[255]);
+        int total_prod[10];
+        fe_mul(total_prod, shared_P[255], R_Z);
+        fe_invert(shared_total_inv, total_prod);
     }
     barrier();
 
-    // 4. Extract individual reciprocals
-    if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
+    // 3) Extract individual reciprocals.
+    int recip[10], total_inv_local[10];
+    fe_mul(recip, shared_P[lid], shared_S[255u - lid]);
+    fe_copy(total_inv_local, shared_total_inv);
+    fe_mul(recip, recip, total_inv_local);
+
+    uint8_t final_pubkey[32];
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
+
+    bool match = true;
+    for (uint i = 0; i < pc.valid_bytes; ++i) {
+        if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
+            match = false;
+            break;
         }
+    }
 
-        int S_excl[10];
-        if (lid == 255) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
-        int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
-
-        uint8_t final_pubkey[32];
-        ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
-
-        bool match = true;
-        for (uint i = 0; i < pc.valid_bytes; ++i) {
-            if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
-                match = false;
-                break;
-            }
-        }
-
-        if (match) {
-            atomicCompSwap(result_index, -1, int(id));
-        }
+    if (match) {
+        atomicCompSwap(result_index, -1, int(id));
     }
 }
