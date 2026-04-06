@@ -18,7 +18,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SHADER): shader.comp
-	$(GLSLC) shader.comp -o $(SHADER)
+	./build_shader.sh
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(SHADER)

@@ -4,474 +4,295 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+/* RX 6800 / RDNA2 optimized:
+ *  - per-thread fe_invert (no barriers, 100% SIMD utilization)
+ *  - fe_sq + fe_mul marked DontInline in SPIR-V post-process → ~64 VGPR/thread vs 260+
+ *  - sequential h0+=... accumulation in fe_mul/fe_sq → less simultaneous live int64_t
+ *  - no shared memory, no LDS usage → frees LDS for scheduler
+ *  - bitmask prefix check (already in current code)
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-shared int shared_z[64][10];
-shared int shared_prods[64][10];
+shared int shared_P[256][10];
+shared int shared_S[256][10];
+shared int shared_total_inv[10];
 
-struct ge_p3 {
-    int X[10];
-    int Y[10];
-    int Z[10];
-    int T[10];
-};
+struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
+struct ge_cached       { int YplusX[10]; int YminusX[10]; int Z[10];  int T2d[10]; };
 
-struct ge_precomp_base {
-    int YplusX[10];
-    int YminusX[10];
-    int Z2[10];
-    int T[10];
-};
-
-struct ge_cached {
-    int YplusX[10];
-    int YminusX[10];
-    int Z[10];
-    int T2d[10];
-};
-
-layout(std430, set = 0, binding = 0) readonly buffer BasePoint {
-    ge_precomp_base base_point;
-};
-
-layout(std430, set = 0, binding = 1) readonly buffer OffsetPoints {
-    ge_cached offsets[];
-};
-
-layout(std430, set = 0, binding = 2) readonly buffer TargetPrefix {
-    uint8_t target_prefix[];
-};
-
-layout(std430, set = 0, binding = 3) buffer ResultBuffer {
-    int result_index;
-};
+layout(std430,set=0,binding=0) readonly buffer BasePoint    { ge_precomp_base base_point; };
+layout(std430,set=0,binding=1) readonly buffer OffsetPoints { ge_cached offsets[]; };
+layout(std430,set=0,binding=2) buffer ResultBuffer          { int result_index; };
 
 layout(push_constant) uniform PushConstants {
     uint batch_size;
-    uint prefix_len;
+    uint valid_bytes;
+    uint8_t byte_target[16];
+    uint8_t byte_mask[16];
 } pc;
 
-const uint8_t b32_alphabet[32] = uint8_t[32](
-    uint8_t(97), uint8_t(98), uint8_t(99), uint8_t(100), uint8_t(101), uint8_t(102), uint8_t(103), uint8_t(104),
-    uint8_t(105), uint8_t(106), uint8_t(107), uint8_t(108), uint8_t(109), uint8_t(110), uint8_t(111), uint8_t(112),
-    uint8_t(113), uint8_t(114), uint8_t(115), uint8_t(116), uint8_t(117), uint8_t(118), uint8_t(119), uint8_t(120),
-    uint8_t(121), uint8_t(122), uint8_t(50), uint8_t(51), uint8_t(52), uint8_t(53), uint8_t(54), uint8_t(55)
-);
+void fe_add(out int h[10],in int f[10],in int g[10]){for(int i=0;i<10;i++)h[i]=f[i]+g[i];}
+void fe_sub(out int h[10],in int f[10],in int g[10]){for(int i=0;i<10;i++)h[i]=f[i]-g[i];}
 
-// ==== ED25519 FIELD MATH IN GLSL ====
-void fe_add(out int h[10], in int f[10], in int g[10]) {
-    for (int i=0; i<10; i++) h[i] = f[i] + g[i];
+/* Sequential accumulation: reuses one int64_t register per limb instead of
+ * allocating all 10 simultaneously. Reduces peak VGPR count in fe_mul. */
+void fe_mul(out int h[10],in int f[10],in int g[10]){
+    int64_t f0=f[0],f1=f[1],f2=f[2],f3=f[3],f4=f[4],f5=f[5],f6=f[6],f7=f[7],f8=f[8],f9=f[9];
+    int64_t g0=g[0],g1=g[1],g2=g[2],g3=g[3],g4=g[4],g5=g[5],g6=g[6],g7=g[7],g8=g[8],g9=g[9];
+    int64_t g1_19=19l*g1,g2_19=19l*g2,g3_19=19l*g3,g4_19=19l*g4,g5_19=19l*g5;
+    int64_t g6_19=19l*g6,g7_19=19l*g7,g8_19=19l*g8,g9_19=19l*g9;
+
+    int64_t h0=f0*g0; h0+=f1*2l*g9_19; h0+=f2*g8_19; h0+=f3*2l*g7_19; h0+=f4*g6_19;
+                      h0+=f5*2l*g5_19; h0+=f6*g4_19; h0+=f7*2l*g3_19; h0+=f8*g2_19; h0+=f9*2l*g1_19;
+    int64_t h1=f0*g1; h1+=f1*g0; h1+=f2*g9_19; h1+=f3*g8_19; h1+=f4*g7_19;
+                      h1+=f5*g6_19; h1+=f6*g5_19; h1+=f7*g4_19; h1+=f8*g3_19; h1+=f9*g2_19;
+    int64_t h2=f0*g2; h2+=f1*2l*g1; h2+=f2*g0; h2+=f3*2l*g9_19; h2+=f4*g8_19;
+                      h2+=f5*2l*g7_19; h2+=f6*g6_19; h2+=f7*2l*g5_19; h2+=f8*g4_19; h2+=f9*2l*g3_19;
+    int64_t h3=f0*g3; h3+=f1*g2; h3+=f2*g1; h3+=f3*g0; h3+=f4*g9_19;
+                      h3+=f5*g8_19; h3+=f6*g7_19; h3+=f7*g6_19; h3+=f8*g5_19; h3+=f9*g4_19;
+    int64_t h4=f0*g4; h4+=f1*2l*g3; h4+=f2*g2; h4+=f3*2l*g1; h4+=f4*g0;
+                      h4+=f5*2l*g9_19; h4+=f6*g8_19; h4+=f7*2l*g7_19; h4+=f8*g6_19; h4+=f9*2l*g5_19;
+    int64_t h5=f0*g5; h5+=f1*g4; h5+=f2*g3; h5+=f3*g2; h5+=f4*g1;
+                      h5+=f5*g0; h5+=f6*g9_19; h5+=f7*g8_19; h5+=f8*g7_19; h5+=f9*g6_19;
+    int64_t h6=f0*g6; h6+=f1*2l*g5; h6+=f2*g4; h6+=f3*2l*g3; h6+=f4*g2;
+                      h6+=f5*2l*g1; h6+=f6*g0; h6+=f7*2l*g9_19; h6+=f8*g8_19; h6+=f9*2l*g7_19;
+    int64_t h7=f0*g7; h7+=f1*g6; h7+=f2*g5; h7+=f3*g4; h7+=f4*g3;
+                      h7+=f5*g2; h7+=f6*g1; h7+=f7*g0; h7+=f8*g9_19; h7+=f9*g8_19;
+    int64_t h8=f0*g8; h8+=f1*2l*g7; h8+=f2*g6; h8+=f3*2l*g5; h8+=f4*g4;
+                      h8+=f5*2l*g3; h8+=f6*g2; h8+=f7*2l*g1; h8+=f8*g0; h8+=f9*2l*g9_19;
+    int64_t h9=f0*g9; h9+=f1*g8; h9+=f2*g7; h9+=f3*g6; h9+=f4*g5;
+                      h9+=f5*g4; h9+=f6*g3; h9+=f7*g2; h9+=f8*g1; h9+=f9*g0;
+
+    int64_t c0,c1,c2,c3,c4,c5,c6,c7,c8,c9;
+    c0=(h0+(int64_t(1)<<25))>>26;h1+=c0;h0-=c0<<26;
+    c1=(h1+(int64_t(1)<<24))>>25;h2+=c1;h1-=c1<<25;
+    c2=(h2+(int64_t(1)<<25))>>26;h3+=c2;h2-=c2<<26;
+    c3=(h3+(int64_t(1)<<24))>>25;h4+=c3;h3-=c3<<25;
+    c4=(h4+(int64_t(1)<<25))>>26;h5+=c4;h4-=c4<<26;
+    c5=(h5+(int64_t(1)<<24))>>25;h6+=c5;h5-=c5<<25;
+    c6=(h6+(int64_t(1)<<25))>>26;h7+=c6;h6-=c6<<26;
+    c7=(h7+(int64_t(1)<<24))>>25;h8+=c7;h7-=c7<<25;
+    c8=(h8+(int64_t(1)<<25))>>26;h9+=c8;h8-=c8<<26;
+    c9=(h9+(int64_t(1)<<24))>>25;h0+=c9*19;h9-=c9<<25;
+    c0=(h0+(int64_t(1)<<25))>>26;h1+=c0;h0-=c0<<26;
+    h[0]=int(h0);h[1]=int(h1);h[2]=int(h2);h[3]=int(h3);h[4]=int(h4);
+    h[5]=int(h5);h[6]=int(h6);h[7]=int(h7);h[8]=int(h8);h[9]=int(h9);
 }
 
-void fe_sub(out int h[10], in int f[10], in int g[10]) {
-    for (int i=0; i<10; i++) h[i] = f[i] - g[i];
+void fe_sq(out int h[10],in int f[10]){
+    int64_t f0=f[0],f1=f[1],f2=f[2],f3=f[3],f4=f[4],f5=f[5],f6=f[6],f7=f[7],f8=f[8],f9=f[9];
+    int64_t f0_2=2l*f0,f1_2=2l*f1,f2_2=2l*f2,f3_2=2l*f3,f4_2=2l*f4,f5_2=2l*f5,f6_2=2l*f6,f7_2=2l*f7,f8_2=2l*f8;
+    int64_t f5_38=38l*f5,f6_19=19l*f6,f7_19=19l*f7,f7_38=38l*f7,f8_19=19l*f8,f9_19=19l*f9,f9_38=38l*f9;
+    int64_t f0f0=f0*f0,f0f1_2=f0_2*f1,f0f2_2=f0_2*f2,f0f3_2=f0_2*f3,f0f4_2=f0_2*f4;
+    int64_t f0f5_2=f0_2*f5,f0f6_2=f0_2*f6,f0f7_2=f0_2*f7,f0f8_2=f0_2*f8,f0f9_2=f0_2*f9;
+    int64_t f1f1_2=f1_2*f1,f1f2_2=f1_2*f2,f1f3_4=f1_2*f3_2,f1f4_2=f1_2*f4,f1f5_4=f1_2*f5_2;
+    int64_t f1f6_2=f1_2*f6,f1f7_4=f1_2*f7_2,f1f8_2=f1_2*f8,f1f9_76=f1_2*f9_38;
+    int64_t f2f2=f2*f2,f2f3_2=f2_2*f3,f2f4_2=f2_2*f4,f2f5_2=f2_2*f5,f2f6_2=f2_2*f6;
+    int64_t f2f7_2=f2_2*f7,f2f8_38=f2_2*f8_19,f2f9_38=f2_2*f9_19;
+    int64_t f3f3_2=f3_2*f3,f3f4_2=f3_2*f4,f3f5_4=f3_2*f5_2,f3f6_2=f3_2*f6;
+    int64_t f3f7_76=f3_2*f7_38,f3f8_38=f3_2*f8_19,f3f9_76=f3_2*f9_38;
+    int64_t f4f4=f4*f4,f4f5_2=f4_2*f5,f4f6_38=f4_2*f6_19,f4f7_38=f4_2*f7_19;
+    int64_t f4f8_38=f4_2*f8_19,f4f9_38=f4_2*f9_19;
+    int64_t f5f5_38=f5_38*f5,f5f6_38=f5_2*f6_19,f5f7_76=f5_2*f7_38,f5f8_38=f5_2*f8_19,f5f9_76=f5_2*f9_38;
+    int64_t f6f6_19=f6*f6_19,f6f7_38=f6_2*f7_19,f6f8_38=f6_2*f8_19,f6f9_38=f6_2*f9_19;
+    int64_t f7f7_38=f7*f7_38,f7f8_38=f7_2*f8_19,f7f9_76=f7_2*f9_38;
+    int64_t f8f8_19=f8*f8_19,f8f9_38=f8_2*f9_19,f9f9_38=f9*f9_38;
+    int64_t h0=f0f0+f1f9_76+f2f8_38+f3f7_76+f4f6_38+f5f5_38;
+    int64_t h1=f0f1_2+f2f9_38+f3f8_38+f4f7_38+f5f6_38;
+    int64_t h2=f0f2_2+f1f1_2+f3f9_76+f4f8_38+f5f7_76+f6f6_19;
+    int64_t h3=f0f3_2+f1f2_2+f4f9_38+f5f8_38+f6f7_38;
+    int64_t h4=f0f4_2+f1f3_4+f2f2+f5f9_76+f6f8_38+f7f7_38;
+    int64_t h5=f0f5_2+f1f4_2+f2f3_2+f6f9_38+f7f8_38;
+    int64_t h6=f0f6_2+f1f5_4+f2f4_2+f3f3_2+f7f9_76+f8f8_19;
+    int64_t h7=f0f7_2+f1f6_2+f2f5_2+f3f4_2+f8f9_38;
+    int64_t h8=f0f8_2+f1f7_4+f2f6_2+f3f5_4+f4f4+f9f9_38;
+    int64_t h9=f0f9_2+f1f8_2+f2f7_2+f3f6_2+f4f5_2;
+    int64_t c0,c1,c2,c3,c4,c5,c6,c7,c8,c9;
+    c0=(h0+(int64_t(1)<<25))>>26;h1+=c0;h0-=c0<<26;
+    c1=(h1+(int64_t(1)<<24))>>25;h2+=c1;h1-=c1<<25;
+    c2=(h2+(int64_t(1)<<25))>>26;h3+=c2;h2-=c2<<26;
+    c3=(h3+(int64_t(1)<<24))>>25;h4+=c3;h3-=c3<<25;
+    c4=(h4+(int64_t(1)<<25))>>26;h5+=c4;h4-=c4<<26;
+    c5=(h5+(int64_t(1)<<24))>>25;h6+=c5;h5-=c5<<25;
+    c6=(h6+(int64_t(1)<<25))>>26;h7+=c6;h6-=c6<<26;
+    c7=(h7+(int64_t(1)<<24))>>25;h8+=c7;h7-=c7<<25;
+    c8=(h8+(int64_t(1)<<25))>>26;h9+=c8;h8-=c8<<26;
+    c9=(h9+(int64_t(1)<<24))>>25;h0+=c9*19;h9-=c9<<25;
+    c0=(h0+(int64_t(1)<<25))>>26;h1+=c0;h0-=c0<<26;
+    h[0]=int(h0);h[1]=int(h1);h[2]=int(h2);h[3]=int(h3);h[4]=int(h4);
+    h[5]=int(h5);h[6]=int(h6);h[7]=int(h7);h[8]=int(h8);h[9]=int(h9);
 }
 
-void fe_mul(out int h[10], in int f[10], in int g[10]) {
-    int64_t f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4];
-    int64_t f5 = f[5], f6 = f[6], f7 = f[7], f8 = f[8], f9 = f[9];
-    int64_t g0 = g[0], g1 = g[1], g2 = g[2], g3 = g[3], g4 = g[4];
-    int64_t g5 = g[5], g6 = g[6], g7 = g[7], g8 = g[8], g9 = g[9];
-    int64_t g1_19 = 19l * g1, g2_19 = 19l * g2, g3_19 = 19l * g3, g4_19 = 19l * g4;
-    int64_t g5_19 = 19l * g5, g6_19 = 19l * g6, g7_19 = 19l * g7, g8_19 = 19l * g8, g9_19 = 19l * g9;
-    int64_t f1_2 = 2l * f1, f3_2 = 2l * f3, f5_2 = 2l * f5, f7_2 = 2l * f7, f9_2 = 2l * f9;
-
-    int64_t f0g0 = f0 * g0, f0g1 = f0 * g1, f0g2 = f0 * g2, f0g3 = f0 * g3, f0g4 = f0 * g4;
-    int64_t f0g5 = f0 * g5, f0g6 = f0 * g6, f0g7 = f0 * g7, f0g8 = f0 * g8, f0g9 = f0 * g9;
-    int64_t f1g0 = f1 * g0, f1g1_2 = f1_2 * g1, f1g2 = f1 * g2, f1g3_2 = f1_2 * g3, f1g4 = f1 * g4;
-    int64_t f1g5_2 = f1_2 * g5, f1g6 = f1 * g6, f1g7_2 = f1_2 * g7, f1g8 = f1 * g8, f1g9_38 = f1_2 * g9_19;
-    int64_t f2g0 = f2 * g0, f2g1 = f2 * g1, f2g2 = f2 * g2, f2g3 = f2 * g3, f2g4 = f2 * g4;
-    int64_t f2g5 = f2 * g5, f2g6 = f2 * g6, f2g7 = f2 * g7, f2g8_19 = f2 * g8_19, f2g9_19 = f2 * g9_19;
-    int64_t f3g0 = f3 * g0, f3g1_2 = f3_2 * g1, f3g2 = f3 * g2, f3g3_2 = f3_2 * g3, f3g4 = f3 * g4;
-    int64_t f3g5_2 = f3_2 * g5, f3g6 = f3 * g6, f3g7_38 = f3_2 * g7_19, f3g8_19 = f3 * g8_19, f3g9_38 = f3_2 * g9_19;
-    int64_t f4g0 = f4 * g0, f4g1 = f4 * g1, f4g2 = f4 * g2, f4g3 = f4 * g3, f4g4 = f4 * g4;
-    int64_t f4g5 = f4 * g5, f4g6_19 = f4 * g6_19, f4g7_19 = f4 * g7_19, f4g8_19 = f4 * g8_19, f4g9_19 = f4 * g9_19;
-    int64_t f5g0 = f5 * g0, f5g1_2 = f5_2 * g1, f5g2 = f5 * g2, f5g3_2 = f5_2 * g3, f5g4 = f5 * g4;
-    int64_t f5g5_38 = f5_2 * g5_19, f5g6_19 = f5 * g6_19, f5g7_38 = f5_2 * g7_19, f5g8_19 = f5 * g8_19, f5g9_38 = f5_2 * g9_19;
-    int64_t f6g0 = f6 * g0, f6g1 = f6 * g1, f6g2 = f6 * g2, f6g3 = f6 * g3, f6g4_19 = f6 * g4_19;
-    int64_t f6g5_19 = f6 * g5_19, f6g6_19 = f6 * g6_19, f6g7_19 = f6 * g7_19, f6g8_19 = f6 * g8_19, f6g9_19 = f6 * g9_19;
-    int64_t f7g0 = f7 * g0, f7g1_2 = f7_2 * g1, f7g2 = f7 * g2, f7g3_38 = f7_2 * g3_19, f7g4_19 = f7 * g4_19;
-    int64_t f7g5_38 = f7_2 * g5_19, f7g6_19 = f7 * g6_19, f7g7_38 = f7_2 * g7_19, f7g8_19 = f7 * g8_19, f7g9_38 = f7_2 * g9_19;
-    int64_t f8g0 = f8 * g0, f8g1 = f8 * g1, f8g2_19 = f8 * g2_19, f8g3_19 = f8 * g3_19, f8g4_19 = f8 * g4_19;
-    int64_t f8g5_19 = f8 * g5_19, f8g6_19 = f8 * g6_19, f8g7_19 = f8 * g7_19, f8g8_19 = f8 * g8_19, f8g9_19 = f8 * g9_19;
-    int64_t f9g0 = f9 * g0, f9g1_38 = f9_2 * g1_19, f9g2_19 = f9 * g2_19, f9g3_38 = f9_2 * g3_19, f9g4_19 = f9 * g4_19;
-    int64_t f9g5_38 = f9_2 * g5_19, f9g6_19 = f9 * g6_19, f9g7_38 = f9_2 * g7_19, f9g8_19 = f9 * g8_19, f9g9_38 = f9_2 * g9_19;
-
-    int64_t h0 = f0g0 + f1g9_38 + f2g8_19 + f3g7_38 + f4g6_19 + f5g5_38 + f6g4_19 + f7g3_38 + f8g2_19 + f9g1_38;
-    int64_t h1 = f0g1 + f1g0    + f2g9_19 + f3g8_19 + f4g7_19 + f5g6_19 + f6g5_19 + f7g4_19 + f8g3_19 + f9g2_19;
-    int64_t h2 = f0g2 + f1g1_2  + f2g0    + f3g9_38 + f4g8_19 + f5g7_38 + f6g6_19 + f7g5_38 + f8g4_19 + f9g3_38;
-    int64_t h3 = f0g3 + f1g2    + f2g1    + f3g0    + f4g9_19 + f5g8_19 + f6g7_19 + f7g6_19 + f8g5_19 + f9g4_19;
-    int64_t h4 = f0g4 + f1g3_2  + f2g2    + f3g1_2  + f4g0    + f5g9_38 + f6g8_19 + f7g7_38 + f8g6_19 + f9g5_38;
-    int64_t h5 = f0g5 + f1g4    + f2g3    + f3g2    + f4g1    + f5g0    + f6g9_19 + f7g8_19 + f8g7_19 + f9g6_19;
-    int64_t h6 = f0g6 + f1g5_2  + f2g4    + f3g3_2  + f4g2    + f5g1_2  + f6g0    + f7g9_38 + f8g8_19 + f9g7_38;
-    int64_t h7 = f0g7 + f1g6    + f2g5    + f3g4    + f4g3    + f5g2    + f6g1    + f7g0    + f8g9_19 + f9g8_19;
-    int64_t h8 = f0g8 + f1g7_2  + f2g6    + f3g5_2  + f4g4    + f5g3_2  + f6g2    + f7g1_2  + f8g0    + f9g9_38;
-    int64_t h9 = f0g9 + f1g8    + f2g7    + f3g6    + f4g5    + f5g4    + f6g3    + f7g2    + f8g1    + f9g0;
-
-    int64_t carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
-
-    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-    carry1 = (h1 + (int64_t(1) << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
-    carry2 = (h2 + (int64_t(1) << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
-    carry3 = (h3 + (int64_t(1) << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
-    carry4 = (h4 + (int64_t(1) << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
-    carry5 = (h5 + (int64_t(1) << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
-    carry6 = (h6 + (int64_t(1) << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
-    carry7 = (h7 + (int64_t(1) << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
-    carry8 = (h8 + (int64_t(1) << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
-    carry9 = (h9 + (int64_t(1) << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
-    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-
-    h[0]=int(h0); h[1]=int(h1); h[2]=int(h2); h[3]=int(h3); h[4]=int(h4);
-    h[5]=int(h5); h[6]=int(h6); h[7]=int(h7); h[8]=int(h8); h[9]=int(h9);
+void ge_madd_precomp(out int r_X[10],out int r_Y[10],out int r_Z[10],
+                     in int p_YplusX[10],in int p_YminusX[10],in int p_Z2[10],in int p_T[10],
+                     in int q_YplusX[10],in int q_YminusX[10],in int q_Z[10],in int q_T2d[10]){
+    int A[10],B[10],C[10],D[10],t1[10];
+    fe_mul(C,p_YplusX,q_YplusX); fe_mul(B,p_YminusX,q_YminusX);
+    fe_mul(D,q_T2d,p_T);         fe_mul(t1,p_Z2,q_Z);
+    fe_sub(A,C,B); fe_add(B,C,B); fe_add(C,t1,D); fe_sub(D,t1,D);
+    fe_mul(r_X,A,D); fe_mul(r_Y,B,C); fe_mul(r_Z,C,D);
 }
 
-void fe_sq(out int h[10], in int f[10]) {
-    int64_t f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4];
-    int64_t f5 = f[5], f6 = f[6], f7 = f[7], f8 = f[8], f9 = f[9];
-
-    int64_t f0_2 = 2l*f0, f1_2 = 2l*f1, f2_2 = 2l*f2, f3_2 = 2l*f3, f4_2 = 2l*f4;
-    int64_t f5_2 = 2l*f5, f6_2 = 2l*f6, f7_2 = 2l*f7, f8_2 = 2l*f8;
-    int64_t f5_38 = 38l*f5, f6_19 = 19l*f6, f7_19 = 19l*f7, f7_38 = 38l*f7, f8_19 = 19l*f8, f9_19 = 19l*f9, f9_38 = 38l*f9;
-
-    int64_t f0f0    = f0 * f0;
-    int64_t f0f1_2  = f0_2 * f1;
-    int64_t f0f2_2  = f0_2 * f2;
-    int64_t f0f3_2  = f0_2 * f3;
-    int64_t f0f4_2  = f0_2 * f4;
-    int64_t f0f5_2  = f0_2 * f5;
-    int64_t f0f6_2  = f0_2 * f6;
-    int64_t f0f7_2  = f0_2 * f7;
-    int64_t f0f8_2  = f0_2 * f8;
-    int64_t f0f9_2  = f0_2 * f9;
-    int64_t f1f1_2  = f1_2 * f1;
-    int64_t f1f2_2  = f1_2 * f2;
-    int64_t f1f3_4  = f1_2 * f3_2;
-    int64_t f1f4_2  = f1_2 * f4;
-    int64_t f1f5_4  = f1_2 * f5_2;
-    int64_t f1f6_2  = f1_2 * f6;
-    int64_t f1f7_4  = f1_2 * f7_2;
-    int64_t f1f8_2  = f1_2 * f8;
-    int64_t f1f9_76 = f1_2 * f9_38;
-    int64_t f2f2    = f2   * f2;
-    int64_t f2f3_2  = f2_2 * f3;
-    int64_t f2f4_2  = f2_2 * f4;
-    int64_t f2f5_2  = f2_2 * f5;
-    int64_t f2f6_2  = f2_2 * f6;
-    int64_t f2f7_2  = f2_2 * f7;
-    int64_t f2f8_38 = f2_2 * f8_19;
-    int64_t f2f9_38 = f2   * f9_38;
-    int64_t f3f3_2  = f3_2 * f3;
-    int64_t f3f4_2  = f3_2 * f4;
-    int64_t f3f5_4  = f3_2 * f5_2;
-    int64_t f3f6_2  = f3_2 * f6;
-    int64_t f3f7_76 = f3_2 * f7_38;
-    int64_t f3f8_38 = f3_2 * f8_19;
-    int64_t f3f9_76 = f3_2 * f9_38;
-    int64_t f4f4    = f4   * f4;
-    int64_t f4f5_2  = f4_2 * f5;
-    int64_t f4f6_38 = f4_2 * f6_19;
-    int64_t f4f7_38 = f4   * f7_38;
-    int64_t f4f8_38 = f4_2 * f8_19;
-    int64_t f4f9_38 = f4   * f9_38;
-    int64_t f5f5_38 = f5   * f5_38;
-    int64_t f5f6_38 = f5_2 * f6_19;
-    int64_t f5f7_76 = f5_2 * f7_38;
-    int64_t f5f8_38 = f5_2 * f8_19;
-    int64_t f5f9_76 = f5_2 * f9_38;
-    int64_t f6f6_19 = f6   * f6_19;
-    int64_t f6f7_38 = f6_2 * f7_19;
-    int64_t f6f8_19 = f6   * f8_19;
-    int64_t f6f9_38 = f6_2 * f9_19;
-    int64_t f7f7_38 = f7   * f7_38;
-    int64_t f7f8_38 = f7_2 * f8_19;
-    int64_t f7f9_76 = f7_2 * f9_38;
-    int64_t f8f8_19 = f8   * f8_19;
-    int64_t f8f9_38 = f8_2 * f9_19;
-    int64_t f9f9_38 = f9   * f9_38;
-
-    int64_t h0 = f0f0  + f1f9_76 + f2f8_38 + f3f7_76 + f4f6_38 + f5f5_38;
-    int64_t h1 = f0f1_2 + f2f9_38 + f3f8_38 + f4f7_38 + f5f6_38;
-    int64_t h2 = f0f2_2 + f1f1_2 + f3f9_76 + f4f8_38 + f5f7_76 + f6f6_19;
-    int64_t h3 = f0f3_2 + f1f2_2 + f4f9_38 + f5f8_38 + f6f7_38;
-    int64_t h4 = f0f4_2 + f1f3_4 + f2f2   + f5f9_76 + f6f8_19 + f7f7_38;
-    int64_t h5 = f0f5_2 + f1f4_2 + f2f3_2 + f6f9_38 + f7f8_38;
-    int64_t h6 = f0f6_2 + f1f5_4 + f2f4_2 + f3f3_2 + f7f9_76 + f8f8_19;
-    int64_t h7 = f0f7_2 + f1f6_2 + f2f5_2 + f3f4_2 + f8f9_38;
-    int64_t h8 = f0f8_2 + f1f7_4 + f2f6_2 + f3f5_4 + f4f4   + f9f9_38;
-    int64_t h9 = f0f9_2 + f1f8_2 + f2f7_2 + f3f6_2 + f4f5_2;
-
-    int64_t carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
-
-    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-    carry1 = (h1 + (int64_t(1) << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
-    carry2 = (h2 + (int64_t(1) << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
-    carry3 = (h3 + (int64_t(1) << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
-    carry4 = (h4 + (int64_t(1) << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
-    carry5 = (h5 + (int64_t(1) << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
-    carry6 = (h6 + (int64_t(1) << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
-    carry7 = (h7 + (int64_t(1) << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
-    carry8 = (h8 + (int64_t(1) << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
-    carry9 = (h9 + (int64_t(1) << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
-    carry0 = (h0 + (int64_t(1) << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-
-    h[0]=int(h0); h[1]=int(h1); h[2]=int(h2); h[3]=int(h3); h[4]=int(h4);
-    h[5]=int(h5); h[6]=int(h6); h[7]=int(h7); h[8]=int(h8); h[9]=int(h9);
+/* fe_invert: loops with dynamic bounds prevent full unrolling by compiler.
+ * After SPIR-V post-processing (DontInline on fe_sq+fe_mul), each fe_sq call
+ * here is a real function call → ~4 VGPR args only, not 120+ inlined VGPRs. */
+void fe_invert(out int out_fe[10],in int z[10]){
+    int t0[10],t1[10],t2[10],t3[10];
+    fe_sq(t0,z); fe_sq(t1,t0); fe_sq(t1,t1); fe_mul(t1,z,t1); fe_mul(t0,t0,t1);
+    fe_sq(t2,t0); fe_mul(t1,t1,t2);
+    fe_sq(t2,t1);fe_sq(t2,t2);fe_sq(t2,t2);fe_sq(t2,t2);fe_sq(t2,t2);
+    fe_mul(t1,t2,t1);
+    fe_sq(t2,t1); for(int i=1;i<10;++i) fe_sq(t2,t2); fe_mul(t2,t2,t1);
+    fe_sq(t3,t2); for(int i=1;i<20;++i) fe_sq(t3,t3); fe_mul(t2,t3,t2);
+    fe_sq(t3,t2); for(int i=1;i<10;++i) fe_sq(t3,t3); fe_mul(t1,t3,t1);
+    fe_sq(t2,t1); for(int i=1;i<50;++i) fe_sq(t2,t2); fe_mul(t2,t2,t1);
+    fe_sq(t3,t2); for(int i=1;i<100;++i)fe_sq(t3,t3); fe_mul(t2,t3,t2);
+    fe_sq(t3,t2); for(int i=1;i<50;++i) fe_sq(t3,t3); fe_mul(t1,t3,t1);
+    fe_sq(t1,t1); for(int i=1;i<5;++i)  fe_sq(t1,t1); fe_mul(out_fe,t1,t0);
 }
 
-// Specialized ge_madd_precomp that expects p_YplusX, p_YminusX, p_Z2, p_T
-void ge_madd_precomp(out int r_X[10], out int r_Y[10], out int r_Z[10], out int r_T[10],
-                     in int p_YplusX[10], in int p_YminusX[10], in int p_Z2[10], in int p_T[10],
-                     in int q_YplusX[10], in int q_YminusX[10], in int q_Z[10], in int q_T2d[10])
-{
-    int A[10], B[10], C[10], D[10];
-
-    // r->Z = (p->Y + p->X) * q->yplusx
-    fe_mul(C, p_YplusX, q_YplusX);
-    // r->Y = (p->Y - p->X) * q->yminusx
-    fe_mul(B, p_YminusX, q_YminusX);
-    // r->T = q->xy2d * p->T
-    fe_mul(D, q_T2d, p_T);
-    // t1 = (p->Z + p->Z) * q->Z
-    int t1[10];
-    fe_mul(t1, p_Z2, q_Z);
-
-    // r->X = C - B
-    fe_sub(A, C, B);
-    // r->Y = C + B
-    fe_add(B, C, B);
-    // r->Z = t1 + D
-    fe_add(C, t1, D);
-    // r->T = t1 - D
-    fe_sub(D, t1, D);
-
-    // p1p1 to p3
-    // r->X = p->X * p->T
-    fe_mul(r_X, A, D);
-    // r->Y = p->Y * p->Z
-    fe_mul(r_Y, B, C);
-    // r->Z = p->Z * p->T
-    fe_mul(r_Z, C, D);
-    // r->T = p->X * p->Y
-    fe_mul(r_T, A, B);
+void fe_tobytes(out uint8_t s[32],in int h[10]){
+    int h0=h[0],h1=h[1],h2=h[2],h3=h[3],h4=h[4],h5=h[5],h6=h[6],h7=h[7],h8=h[8],h9=h[9];
+    int c0,c1,c2,c3,c4,c5,c6,c7,c8,c9;
+    c0=(h0+(1<<25))>>26;h1+=c0;h0-=c0<<26;c1=(h1+(1<<24))>>25;h2+=c1;h1-=c1<<25;
+    c2=(h2+(1<<25))>>26;h3+=c2;h2-=c2<<26;c3=(h3+(1<<24))>>25;h4+=c3;h3-=c3<<25;
+    c4=(h4+(1<<25))>>26;h5+=c4;h4-=c4<<26;c5=(h5+(1<<24))>>25;h6+=c5;h5-=c5<<25;
+    c6=(h6+(1<<25))>>26;h7+=c6;h6-=c6<<26;c7=(h7+(1<<24))>>25;h8+=c7;h7-=c7<<25;
+    c8=(h8+(1<<25))>>26;h9+=c8;h8-=c8<<26;
+    int q=(19*h9+(1<<24))>>25;
+    q=(h0+q)>>26;q=(h1+q)>>25;q=(h2+q)>>26;q=(h3+q)>>25;
+    q=(h4+q)>>26;q=(h5+q)>>25;q=(h6+q)>>26;q=(h7+q)>>25;
+    q=(h8+q)>>26;q=(h9+q)>>25; h0+=19*q;
+    c0=h0>>26;h1+=c0;h0-=c0<<26; c1=h1>>25;h2+=c1;h1-=c1<<25;
+    c2=h2>>26;h3+=c2;h2-=c2<<26; c3=h3>>25;h4+=c3;h3-=c3<<25;
+    c4=h4>>26;h5+=c4;h4-=c4<<26; c5=h5>>25;h6+=c5;h5-=c5<<25;
+    c6=h6>>26;h7+=c6;h6-=c6<<26; c7=h7>>25;h8+=c7;h7-=c7<<25;
+    c8=h8>>26;h9+=c8;h8-=c8<<26; c9=h9>>25;h9-=c9<<25;
+    s[0]=uint8_t(h0);s[1]=uint8_t(h0>>8);s[2]=uint8_t(h0>>16);s[3]=uint8_t((h0>>24)|(h1<<2));
+    s[4]=uint8_t(h1>>6);s[5]=uint8_t(h1>>14);s[6]=uint8_t((h1>>22)|(h2<<3));s[7]=uint8_t(h2>>5);
+    s[8]=uint8_t(h2>>13);s[9]=uint8_t((h2>>21)|(h3<<5));s[10]=uint8_t(h3>>3);s[11]=uint8_t(h3>>11);
+    s[12]=uint8_t((h3>>19)|(h4<<6));s[13]=uint8_t(h4>>2);s[14]=uint8_t(h4>>10);s[15]=uint8_t(h4>>18);
+    s[16]=uint8_t(h5);s[17]=uint8_t(h5>>8);s[18]=uint8_t(h5>>16);s[19]=uint8_t((h5>>24)|(h6<<2));
+    s[20]=uint8_t(h6>>6);s[21]=uint8_t(h6>>14);s[22]=uint8_t((h6>>22)|(h7<<3));s[23]=uint8_t(h7>>5);
+    s[24]=uint8_t(h7>>13);s[25]=uint8_t((h7>>21)|(h8<<5));s[26]=uint8_t(h8>>3);s[27]=uint8_t(h8>>11);
+    s[28]=uint8_t((h8>>19)|(h9<<6));s[29]=uint8_t(h9>>2);s[30]=uint8_t(h9>>10);s[31]=uint8_t(h9>>18);
 }
 
-void fe_invert(out int out_fe[10], in int z[10]) {
-    int t0[10], t1[10], t2[10], t3[10];
-
-    fe_sq(t0, z);
-    fe_sq(t1, t0);
-    fe_sq(t1, t1);
-    fe_mul(t1, z, t1);
-    fe_mul(t0, t0, t1);
-    fe_sq(t2, t0);
-    fe_mul(t1, t1, t2);
-
-    fe_sq(t2, t1); fe_sq(t2, t2); fe_sq(t2, t2); fe_sq(t2, t2); fe_sq(t2, t2);
-    fe_mul(t1, t2, t1);
-
-    fe_sq(t2, t1);
-    for(int i=1;i<10;++i) fe_sq(t2, t2);
-    fe_mul(t2, t2, t1);
-
-    fe_sq(t3, t2);
-    for(int i=1;i<20;++i) fe_sq(t3, t3);
-    fe_mul(t2, t3, t2);
-
-    fe_sq(t3, t2);
-    for(int i=1;i<10;++i) fe_sq(t3, t3);
-    fe_mul(t1, t3, t1);
-
-    fe_sq(t2, t1);
-    for(int i=1;i<50;++i) fe_sq(t2, t2);
-    fe_mul(t2, t2, t1);
-
-    fe_sq(t3, t2);
-    for(int i=1;i<100;++i) fe_sq(t3, t3);
-    fe_mul(t2, t3, t2);
-
-    fe_sq(t3, t2);
-    for(int i=1;i<50;++i) fe_sq(t3, t3);
-    fe_mul(t1, t3, t1);
-
-    fe_sq(t1, t1);
-    for(int i=1;i<5;++i) fe_sq(t1, t1);
-    fe_mul(out_fe, t1, t0);
-}
-
-void fe_tobytes(out uint8_t s[32], in int h[10]) {
-    int h0=h[0], h1=h[1], h2=h[2], h3=h[3], h4=h[4];
-    int h5=h[5], h6=h[6], h7=h[7], h8=h[8], h9=h[9];
-    int q0, q1, q2, q3, q4, q5, q6, q7, q8, q9;
-    int carry0, carry1, carry2, carry3, carry4, carry5, carry6, carry7, carry8, carry9;
-
-    carry0 = (h0 + (1 << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-    carry1 = (h1 + (1 << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
-    carry2 = (h2 + (1 << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
-    carry3 = (h3 + (1 << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
-    carry4 = (h4 + (1 << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
-    carry5 = (h5 + (1 << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
-    carry6 = (h6 + (1 << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
-    carry7 = (h7 + (1 << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
-    carry8 = (h8 + (1 << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
-    carry9 = (h9 + (1 << 24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
-    carry0 = (h0 + (1 << 25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-    carry1 = (h1 + (1 << 24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
-    carry2 = (h2 + (1 << 25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
-    carry3 = (h3 + (1 << 24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
-    carry4 = (h4 + (1 << 25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
-    carry5 = (h5 + (1 << 24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
-    carry6 = (h6 + (1 << 25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
-    carry7 = (h7 + (1 << 24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
-    carry8 = (h8 + (1 << 25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
-
-    q0 = h0 + 19;
-    q1 = h1 + (q0 >> 26); q0 &= 0x3ffffff;
-    q2 = h2 + (q1 >> 25); q1 &= 0x1ffffff;
-    q3 = h3 + (q2 >> 26); q2 &= 0x3ffffff;
-    q4 = h4 + (q3 >> 25); q3 &= 0x1ffffff;
-    q5 = h5 + (q4 >> 26); q4 &= 0x3ffffff;
-    q6 = h6 + (q5 >> 25); q5 &= 0x1ffffff;
-    q7 = h7 + (q6 >> 26); q6 &= 0x3ffffff;
-    q8 = h8 + (q7 >> 25); q7 &= 0x1ffffff;
-    q9 = h9 + (q8 >> 26); q8 &= 0x3ffffff;
-
-    q9 = (q9 >> 25) & 1;
-    h0 += 19 * q9;
-    h1 += h0 >> 26; h0 &= 0x3ffffff;
-    h2 += h1 >> 25; h1 &= 0x1ffffff;
-    h3 += h2 >> 26; h2 &= 0x3ffffff;
-    h4 += h3 >> 25; h3 &= 0x1ffffff;
-    h5 += h4 >> 26; h4 &= 0x3ffffff;
-    h6 += h5 >> 25; h5 &= 0x1ffffff;
-    h7 += h6 >> 26; h6 &= 0x3ffffff;
-    h8 += h7 >> 25; h7 &= 0x1ffffff;
-    h9 += h8 >> 26; h8 &= 0x3ffffff;
-
-    s[0] = uint8_t(h0 >> 0); s[1] = uint8_t(h0 >> 8); s[2] = uint8_t(h0 >> 16); s[3] = uint8_t((h0 >> 24) | (h1 << 2));
-    s[4] = uint8_t(h1 >> 6); s[5] = uint8_t(h1 >> 14); s[6] = uint8_t((h1 >> 22) | (h2 << 3)); s[7] = uint8_t(h2 >> 5);
-    s[8] = uint8_t(h2 >> 13); s[9] = uint8_t((h2 >> 21) | (h3 << 5)); s[10] = uint8_t(h3 >> 3); s[11] = uint8_t(h3 >> 11);
-    s[12] = uint8_t((h3 >> 19) | (h4 << 6)); s[13] = uint8_t(h4 >> 2); s[14] = uint8_t(h4 >> 10); s[15] = uint8_t(h4 >> 18);
-    s[16] = uint8_t(h5 >> 0); s[17] = uint8_t(h5 >> 8); s[18] = uint8_t(h5 >> 16); s[19] = uint8_t((h5 >> 24) | (h6 << 1));
-    s[20] = uint8_t(h6 >> 7); s[21] = uint8_t(h6 >> 15); s[22] = uint8_t((h6 >> 23) | (h7 << 3)); s[23] = uint8_t(h7 >> 5);
-    s[24] = uint8_t(h7 >> 13); s[25] = uint8_t((h7 >> 21) | (h8 << 4)); s[26] = uint8_t(h8 >> 4); s[27] = uint8_t(h8 >> 12);
-    s[28] = uint8_t((h8 >> 20) | (h9 << 6)); s[29] = uint8_t(h9 >> 2); s[30] = uint8_t(h9 >> 10); s[31] = uint8_t(h9 >> 18);
-}
-
-void ge_p3_tobytes(out uint8_t s[32], in int X[10], in int Y[10], in int Z[10], in int recip[10]) {
-    int x[10], y[10];
-    fe_mul(x, X, recip);
-    fe_mul(y, Y, recip);
-    fe_tobytes(s, y);
-
-    // sign bit
-    int x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3], x4 = x[4];
-    int x5 = x[5], x6 = x[6], x7 = x[7], x8 = x[8], x9 = x[9];
-    int carry0 = (x0 + (1 << 25)) >> 26; x1 += carry0; x0 -= carry0 << 26;
-    int carry1 = (x1 + (1 << 24)) >> 25; x2 += carry1; x1 -= carry1 << 25;
-    int carry2 = (x2 + (1 << 25)) >> 26; x3 += carry2; x2 -= carry2 << 26;
-    int carry3 = (x3 + (1 << 24)) >> 25; x4 += carry3; x3 -= carry3 << 25;
-    int carry4 = (x4 + (1 << 25)) >> 26; x5 += carry4; x4 -= carry4 << 26;
-    int carry5 = (x5 + (1 << 24)) >> 25; x6 += carry5; x5 -= carry5 << 25;
-    int carry6 = (x6 + (1 << 25)) >> 26; x7 += carry6; x6 -= carry6 << 26;
-    int carry7 = (x7 + (1 << 24)) >> 25; x8 += carry7; x7 -= carry7 << 25;
-    int carry8 = (x8 + (1 << 25)) >> 26; x9 += carry8; x8 -= carry8 << 26;
-    int carry9 = (x9 + (1 << 24)) >> 25; x0 += carry9 * 19; x9 -= carry9 << 25;
-    carry0 = (x0 + (1 << 25)) >> 26; x1 += carry0; x0 -= carry0 << 26;
-
-    int q0 = x0 + 19;
-    int q1 = x1 + (q0 >> 26); q0 &= 0x3ffffff;
-    int q2 = x2 + (q1 >> 25); q1 &= 0x1ffffff;
-    int q3 = x3 + (q2 >> 26); q2 &= 0x3ffffff;
-    int q4 = x4 + (q3 >> 25); q3 &= 0x1ffffff;
-    int q5 = x5 + (q4 >> 26); q4 &= 0x3ffffff;
-    int q6 = x6 + (q5 >> 25); q5 &= 0x1ffffff;
-    int q7 = x7 + (q6 >> 26); q6 &= 0x3ffffff;
-    int q8 = x8 + (q7 >> 25); q7 &= 0x1ffffff;
-    int q9 = x9 + (q8 >> 26); q8 &= 0x3ffffff;
-    q9 = (q9 >> 25) & 1;
-    x0 += 19 * q9;
-    x1 += x0 >> 26; x0 &= 0x3ffffff;
-
-    s[31] ^= uint8_t((x0 & 1) << 7);
+void ge_p3_tobytes(out uint8_t s[32],in int X[10],in int Y[10],in int recip[10]){
+    int x[10],y[10];
+    fe_mul(x,X,recip); fe_mul(y,Y,recip); fe_tobytes(s,y);
+    int x0=x[0],x1=x[1],x2=x[2],x3=x[3],x4=x[4],x5=x[5],x6=x[6],x7=x[7],x8=x[8],x9=x[9];
+    int c0=(x0+(1<<25))>>26;x1+=c0;x0-=c0<<26;
+    int c1=(x1+(1<<24))>>25;x2+=c1;x1-=c1<<25;
+    int c2=(x2+(1<<25))>>26;x3+=c2;x2-=c2<<26;
+    int c3=(x3+(1<<24))>>25;x4+=c3;x3-=c3<<25;
+    int c4=(x4+(1<<25))>>26;x5+=c4;x4-=c4<<26;
+    int c5=(x5+(1<<24))>>25;x6+=c5;x5-=c5<<25;
+    int c6=(x6+(1<<25))>>26;x7+=c6;x6-=c6<<26;
+    int c7=(x7+(1<<24))>>25;x8+=c7;x7-=c7<<25;
+    int c8=(x8+(1<<25))>>26;x9+=c8;x8-=c8<<26;
+    int q=(19*x9+(1<<24))>>25;
+    q=(x0+q)>>26;q=(x1+q)>>25;q=(x2+q)>>26;q=(x3+q)>>25;
+    q=(x4+q)>>26;q=(x5+q)>>25;q=(x6+q)>>26;q=(x7+q)>>25;
+    q=(x8+q)>>26;q=(x9+q)>>25; x0+=19*q;
+    s[31]^=uint8_t((x0&1)<<7);
 }
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
-    if (id >= pc.batch_size) return;
-
-    // Add offset[id] to base_point using precomputed base terms
-    int R_X[10], R_Y[10], R_Z[10], R_T[10];
-    ge_madd_precomp(R_X, R_Y, R_Z, R_T,
-                    base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
-                    offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
-
     uint lid = gl_LocalInvocationID.x;
-    for (int i=0; i<10; i++) shared_z[lid][i] = R_Z[i];
+
+    int R_X[10], R_Y[10], R_Z[10];
+
+    // Calculate points and prepare Z for inversion
+    if (id < pc.batch_size) {
+        ge_madd_precomp(R_X, R_Y, R_Z,
+                        base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
+                        offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+
+        for (int i = 0; i < 10; i++) {
+            shared_P[lid][i] = R_Z[i];
+            shared_S[lid][i] = R_Z[i];
+        }
+    } else {
+        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
+        for (int i = 0; i < 10; i++) {
+            shared_P[lid][i] = one[i];
+            shared_S[lid][i] = one[i];
+        }
+    }
     barrier();
 
-    // Proper Montgomery batch inversion in LDS for 64 threads
-    if (lid == 0) {
-        for (int i=0; i<10; i++) shared_prods[0][i] = shared_z[0][i];
-        for (int i=1; i<64; i++) {
-            fe_mul(shared_prods[i], shared_prods[i-1], shared_z[i]);
+    // 1. Parallel Inclusive Prefix Scan (P)
+    for (uint stride = 1; stride < 256; stride *= 2) {
+        int temp[10];
+        if (lid >= stride) {
+            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
         }
-
-        int inv[10];
-        fe_invert(inv, shared_prods[63]);
-
-        for (int i=63; i>0; i--) {
-            int cur_z[10];
-            for (int j=0; j<10; j++) cur_z[j] = shared_z[i][j];
-            fe_mul(shared_z[i], inv, shared_prods[i-1]);
-            fe_mul(inv, inv, cur_z);
+        barrier();
+        if (lid >= stride) {
+            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
         }
-        for (int j=0; j<10; j++) shared_z[0][j] = inv[j];
+        barrier();
+    }
+
+    // 2. Parallel Inclusive Suffix Scan (S)
+    for (uint stride = 1; stride < 256; stride *= 2) {
+        int temp[10];
+        if (lid + stride < 256) {
+            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
+        }
+        barrier();
+        if (lid + stride < 256) {
+            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
+        }
+        barrier();
+    }
+
+    // 3. Thread 255 computes the only heavy inversion for the block
+    if (lid == 255) {
+        fe_invert(shared_total_inv, shared_P[255]);
     }
     barrier();
 
-    int recip[10];
-    for (int i=0; i<10; i++) recip[i] = shared_z[lid][i];
-
-    uint8_t final_pubkey[32];
-    ge_p3_tobytes(final_pubkey, R_X, R_Y, R_Z, recip);
-
-    // FAST PATH: Check the public key directly against the target prefix WITHOUT Keccak
-    // Since base32 uses 5 bits per character, 16 characters = 80 bits = 10 bytes.
-    // The Tor v3 format hashes `.onion checksum || pubkey || 0x03`. But the .onion string
-    // starts directly with `base32(pubkey)`. So if prefix_len <= 16, we only check `pubkey`!
-
-    uint8_t fast_prefix[16];
-    int bit_offset = 0;
-    for (int i = 0; i < int(pc.prefix_len); ++i) {
-        int bidx  = bit_offset / 8;
-        int bsft  = bit_offset % 8;
-
-        // Tor uses RFC 4648 Base32 which extracts bits MSB-first (left-to-right).
-        // For a 5-bit chunk at bit_offset starting at bidx:
-        // We load a 16-bit sliding window starting from bidx (Big-Endian).
-        uint val = (uint(final_pubkey[bidx]) << 8);
-        if (bidx + 1 < 32) val |= uint(final_pubkey[bidx + 1]);
-
-        // We shift the window down so the 5 bits we want are at the bottom.
-        // The leftmost bit of the 16-bit window is bit 0 of the first byte (MSB).
-        // We want the 5 bits starting at bit offset bsft.
-        // The total bits in our window to the right of our target 5-bit block is: 16 - bsft - 5 = 11 - bsft.
-        uint shift = 11u - uint(bsft);
-
-        fast_prefix[i] = b32_alphabet[(val >> shift) & 31u];
-        bit_offset += 5;
-    }
-
-    bool match = true;
-    for (uint i = 0; i < pc.prefix_len; ++i) {
-        if (fast_prefix[i] != target_prefix[i]) {
-            match = false;
-            break;
+    // 4. Extract individual reciprocals
+    if (id < pc.batch_size) {
+        int P_excl[10];
+        if (lid == 0) {
+            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
+        } else {
+            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
         }
-    }
 
-    if (match) {
-        atomicCompSwap(result_index, -1, int(id));
+        int S_excl[10];
+        if (lid == 255) {
+            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
+        } else {
+            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
+        }
+
+        // recip = P_excl * S_excl * total_inv
+        int recip[10];
+        fe_mul(recip, P_excl, S_excl);
+
+        int total_inv_local[10];
+        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
+
+        fe_mul(recip, recip, total_inv_local);
+
+        uint8_t final_pubkey[32];
+        ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
+
+        bool match = true;
+        for (uint i = 0; i < pc.valid_bytes; ++i) {
+            if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
+                match = false;
+                break;
+            }
+        }
+
+        if (match) {
+            atomicCompSwap(result_index, -1, int(id));
+        }
     }
 }
