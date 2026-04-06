@@ -5,11 +5,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 /* RX 6800 / RDNA2 optimized:
- *  - per-thread fe_invert (no barriers, 100% SIMD utilization)
- *  - fe_sq + fe_mul marked DontInline in SPIR-V post-process → ~64 VGPR/thread vs 260+
- *  - sequential h0+=... accumulation in fe_mul/fe_sq → less simultaneous live int64_t
- *  - no shared memory, no LDS usage → frees LDS for scheduler
- *  - bitmask prefix check (already in current code)
+ *  - batched Montgomery inversion per workgroup (1x fe_invert per 128 keys)
+ *  - Blelloch exclusive scans (O(n) fe_mul work) instead of Hillis-Steele (O(n log n))
+ *  - fe_sq + fe_mul marked DontInline in SPIR-V post-process to control VGPR pressure
+ *  - bitmask prefix check (push constants)
  */
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 const uint WG_SIZE = 128u;
@@ -202,98 +201,87 @@ void ge_p3_tobytes(out uint8_t s[32],in int X[10],in int Y[10],in int recip[10])
 void main() {
     uint id = gl_GlobalInvocationID.x;
     uint lid = gl_LocalInvocationID.x;
+    uint rid = WG_SIZE - 1u - lid;
 
     int R_X[10], R_Y[10], R_Z[10];
 
-    // Calculate points and prepare Z for inversion
-    if (id < pc.batch_size) {
-        ge_madd_precomp(R_X, R_Y, R_Z,
-                        base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
-                        offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+    ge_madd_precomp(R_X, R_Y, R_Z,
+                    base_point.YplusX, base_point.YminusX, base_point.Z2, base_point.T,
+                    offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
-        }
-    } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
-        }
+    for (int i = 0; i < 10; i++) {
+        shared_P[lid][i] = R_Z[i];
+        shared_S[rid][i] = R_Z[i];
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
-        }
-        barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
+    // Upsweep phase for both arrays (prefix and reversed-prefix for suffix)
+    for (uint stride = 1u; stride < WG_SIZE; stride <<= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int tmp[10];
+            fe_mul(tmp, shared_P[idx - stride], shared_P[idx]);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = tmp[i];
+
+            fe_mul(tmp, shared_S[idx - stride], shared_S[idx]);
+            for (int i = 0; i < 10; i++) shared_S[idx][i] = tmp[i];
         }
         barrier();
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < WG_SIZE) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 3. Last lane computes the only heavy inversion for the workgroup
-    if (lid == WG_SIZE - 1u) {
+    // Single inversion for full workgroup product
+    if (lid == 0u) {
         fe_invert(shared_total_inv, shared_P[WG_SIZE - 1u]);
+
+        for (int i = 0; i < 10; i++) {
+            shared_P[WG_SIZE - 1u][i] = (i == 0) ? 1 : 0;
+            shared_S[WG_SIZE - 1u][i] = (i == 0) ? 1 : 0;
+        }
     }
     barrier();
 
-    // 4. Extract individual reciprocals
-    if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
+    // Downsweep phase -> exclusive scan results
+    for (uint stride = WG_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        uint idx = ((lid + 1u) * (stride << 1u)) - 1u;
+        if (idx < WG_SIZE) {
+            int left[10];
+            int right[10];
 
-        int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
-        int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
-
-        uint8_t final_pubkey[32];
-        ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
-
-        bool match = true;
-        for (uint i = 0; i < pc.valid_bytes; ++i) {
-            if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
-                match = false;
-                break;
+            for (int i = 0; i < 10; i++) {
+                left[i] = shared_P[idx - stride][i];
+                right[i] = shared_P[idx][i];
+                shared_P[idx - stride][i] = right[i];
             }
-        }
+            fe_mul(right, right, left);
+            for (int i = 0; i < 10; i++) shared_P[idx][i] = right[i];
 
-        if (match) {
-            atomicCompSwap(result_index, -1, int(id));
+            for (int i = 0; i < 10; i++) {
+                left[i] = shared_S[idx - stride][i];
+                right[i] = shared_S[idx][i];
+                shared_S[idx - stride][i] = right[i];
+            }
+            fe_mul(right, right, left);
+            for (int i = 0; i < 10; i++) shared_S[idx][i] = right[i];
         }
+        barrier();
+    }
+
+    int recip[10];
+    fe_mul(recip, shared_P[lid], shared_S[rid]);
+    fe_mul(recip, recip, shared_total_inv);
+
+    uint8_t final_pubkey[32];
+    ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
+
+    bool match = true;
+    for (uint i = 0; i < pc.valid_bytes; ++i) {
+        if ((final_pubkey[i] & pc.byte_mask[i]) != pc.byte_target[i]) {
+            match = false;
+            break;
+        }
+    }
+
+    if (match) {
+        atomicCompSwap(result_index, -1, int(id));
     }
 }
