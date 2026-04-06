@@ -5,17 +5,18 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 /* RX 6800 / RDNA2 optimized:
- *  - per-thread fe_invert (no barriers, 100% SIMD utilization)
+ *  - one fe_invert per workgroup + parallel prefix + serial reciprocal rebuild
  *  - fe_sq + fe_mul marked DontInline in SPIR-V post-process → ~64 VGPR/thread vs 260+
  *  - sequential h0+=... accumulation in fe_mul/fe_sq → less simultaneous live int64_t
- *  - no shared memory, no LDS usage → frees LDS for scheduler
+ *  - LDS-backed batch inversion to lower total fe_mul count vs dual scan
  *  - bitmask prefix check (already in current code)
  */
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 const uint WG_SIZE = 128u;
 
+shared int shared_Z[WG_SIZE][10];
 shared int shared_P[WG_SIZE][10];
-shared int shared_S[WG_SIZE][10];
+shared int shared_recip[WG_SIZE][10];
 shared int shared_total_inv[10];
 
 struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
@@ -212,14 +213,14 @@ void main() {
                         offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
         for (int i = 0; i < 10; i++) {
+            shared_Z[lid][i] = R_Z[i];
             shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
         }
     } else {
         int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
         for (int i = 0; i < 10; i++) {
+            shared_Z[lid][i] = one[i];
             shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
         }
     }
     barrier();
@@ -237,49 +238,32 @@ void main() {
         barrier();
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < WG_SIZE) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
-    }
-
-    // 3. Last lane computes the only heavy inversion for the workgroup
+    // 2. Last lane computes the inversion of total product and then
+    //    serially reconstructs per-lane reciprocals:
+    //    inv(z_i) = inv(z_0*...*z_i) * (z_0*...*z_{i-1})
     if (lid == WG_SIZE - 1u) {
         fe_invert(shared_total_inv, shared_P[WG_SIZE - 1u]);
+        int running_inv[10];
+        for (int i = 0; i < 10; i++) running_inv[i] = shared_total_inv[i];
+
+        for (int i = int(WG_SIZE) - 1; i >= 0; --i) {
+            int prefix_excl[10];
+            if (i == 0) {
+                for (int j = 0; j < 10; j++) prefix_excl[j] = (j == 0) ? 1 : 0;
+            } else {
+                for (int j = 0; j < 10; j++) prefix_excl[j] = shared_P[i - 1][j];
+            }
+
+            fe_mul(shared_recip[i], running_inv, prefix_excl);
+            fe_mul(running_inv, running_inv, shared_Z[i]);
+        }
     }
     barrier();
 
-    // 4. Extract individual reciprocals
+    // 3. Convert to bytes and test prefix
     if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
-        int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        // recip = P_excl * S_excl * total_inv
         int recip[10];
-        fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
+        for (int i = 0; i < 10; i++) recip[i] = shared_recip[lid][i];
 
         uint8_t final_pubkey[32];
         ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
