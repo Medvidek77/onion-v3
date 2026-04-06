@@ -203,6 +203,7 @@ void main() {
     uint lid = gl_LocalInvocationID.x;
 
     int R_X[10], R_Y[10], R_Z[10];
+    int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
 
     // Calculate points and prepare Z for inversion
     if (id < pc.batch_size) {
@@ -215,7 +216,6 @@ void main() {
             shared_S[lid][i] = R_Z[i];
         }
     } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
         for (int i = 0; i < 10; i++) {
             shared_P[lid][i] = one[i];
             shared_S[lid][i] = one[i];
@@ -223,50 +223,92 @@ void main() {
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
+    // 1) Inclusive prefix scan (ping-pong) with one barrier/stride.
+    // src=shared_P, dst=shared_S when toggle=0; swapped when toggle=1.
+    bool prefix_toggle = false;
+    for (uint stride = 1; stride < 256; stride <<= 1) {
+        int tmp[10];
+        if (prefix_toggle) {
+            if (lid >= stride) {
+                fe_mul(tmp, shared_S[lid], shared_S[lid - stride]);
+                for (int i = 0; i < 10; i++) shared_P[lid][i] = tmp[i];
+            } else {
+                for (int i = 0; i < 10; i++) shared_P[lid][i] = shared_S[lid][i];
+            }
+        } else {
+            if (lid >= stride) {
+                fe_mul(tmp, shared_P[lid], shared_P[lid - stride]);
+                for (int i = 0; i < 10; i++) shared_S[lid][i] = tmp[i];
+            } else {
+                for (int i = 0; i < 10; i++) shared_S[lid][i] = shared_P[lid][i];
+            }
         }
+        prefix_toggle = !prefix_toggle;
         barrier();
-        if (lid >= stride) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
+    }
+    // Normalize prefix result into shared_P.
+    if (prefix_toggle) {
+        for (int i = 0; i < 10; i++) shared_P[lid][i] = shared_S[lid][i];
+    }
+    barrier();
+
+    // Preload exclusive prefix before reusing shared_P as temp in suffix scan.
+    int P_excl[10];
+    if (lid == 0) {
+        for (int i = 0; i < 10; i++) P_excl[i] = one[i];
+    } else {
+        for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
+    }
+
+    // Reinitialize shared_S with original Z values for suffix scan.
+    if (id < pc.batch_size) {
+        for (int i = 0; i < 10; i++) shared_S[lid][i] = R_Z[i];
+    } else {
+        for (int i = 0; i < 10; i++) shared_S[lid][i] = one[i];
+    }
+    barrier();
+
+    // 2) Inclusive suffix scan (ping-pong) with one barrier/stride.
+    // src=shared_S, dst=shared_P when toggle=0; swapped when toggle=1.
+    bool suffix_toggle = false;
+    for (uint stride = 1; stride < 256; stride <<= 1) {
+        int tmp[10];
+        if (suffix_toggle) {
+            if (lid + stride < 256) {
+                fe_mul(tmp, shared_P[lid], shared_P[lid + stride]);
+                for (int i = 0; i < 10; i++) shared_S[lid][i] = tmp[i];
+            } else {
+                for (int i = 0; i < 10; i++) shared_S[lid][i] = shared_P[lid][i];
+            }
+        } else {
+            if (lid + stride < 256) {
+                fe_mul(tmp, shared_S[lid], shared_S[lid + stride]);
+                for (int i = 0; i < 10; i++) shared_P[lid][i] = tmp[i];
+            } else {
+                for (int i = 0; i < 10; i++) shared_P[lid][i] = shared_S[lid][i];
+            }
         }
+        suffix_toggle = !suffix_toggle;
         barrier();
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
-    for (uint stride = 1; stride < 256; stride *= 2) {
-        int temp[10];
-        if (lid + stride < 256) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < 256) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
-        }
-        barrier();
+    // Normalize suffix result into shared_S.
+    if (suffix_toggle) {
+        for (int i = 0; i < 10; i++) shared_S[lid][i] = shared_P[lid][i];
     }
+    barrier();
 
     // 3. Thread 255 computes the only heavy inversion for the block
     if (lid == 255) {
-        fe_invert(shared_total_inv, shared_P[255]);
+        fe_invert(shared_total_inv, shared_S[0]);
     }
     barrier();
 
     // 4. Extract individual reciprocals
     if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
         int S_excl[10];
         if (lid == 255) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
+            for (int i = 0; i < 10; i++) S_excl[i] = one[i];
         } else {
             for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
         }
@@ -275,10 +317,7 @@ void main() {
         int recip[10];
         fe_mul(recip, P_excl, S_excl);
 
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
+        fe_mul(recip, recip, shared_total_inv);
 
         uint8_t final_pubkey[32];
         ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
