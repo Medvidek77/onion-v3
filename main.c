@@ -23,6 +23,7 @@
 
 #define BATCH_SIZE (1 << 19) // 524,288 keys per batch (~80MB offset buffer, fits inside 128MB AMD Infinity Cache)
 #define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
+#define WORKGROUP_SIZE 128
 
 
 // Internal CPU structs mapping directly to GPU buffers
@@ -571,7 +572,7 @@ int main(int argc, char** argv) {
 
         vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
 
-        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / 256, 1, 1);
+        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / WORKGROUP_SIZE, 1, 1);
         VK_CHECK(vkEndCommandBuffer(commandBuffers[i]));
     }
 
