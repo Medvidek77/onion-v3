@@ -16,6 +16,7 @@ const uint WG_SIZE = 128u;
 
 shared int shared_P[WG_SIZE][10];
 shared int shared_S[WG_SIZE][10];
+shared int shared_T[WG_SIZE][10];
 shared int shared_total_inv[10];
 
 struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
@@ -224,31 +225,54 @@ void main() {
     }
     barrier();
 
-    // 1. Parallel Inclusive Prefix Scan (P)
+    // 1. Parallel Inclusive Prefix Scan (P), ping-pong in LDS with one barrier/step
+    bool prefix_read_from_p = true;
     for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
         int temp[10];
-        if (lid >= stride) {
-            fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
-        }
-        barrier();
-        if (lid >= stride) {
+        if (prefix_read_from_p) {
+            if (lid >= stride) fe_mul(temp, shared_P[lid], shared_P[lid - stride]);
+            else for (int i = 0; i < 10; i++) temp[i] = shared_P[lid][i];
+            for (int i = 0; i < 10; i++) shared_T[lid][i] = temp[i];
+        } else {
+            if (lid >= stride) fe_mul(temp, shared_T[lid], shared_T[lid - stride]);
+            else for (int i = 0; i < 10; i++) temp[i] = shared_T[lid][i];
             for (int i = 0; i < 10; i++) shared_P[lid][i] = temp[i];
         }
         barrier();
+        prefix_read_from_p = !prefix_read_from_p;
+    }
+    if (!prefix_read_from_p) {
+        for (int i = 0; i < 10; i++) shared_P[lid][i] = shared_T[lid][i];
+    }
+    barrier();
+
+    int P_excl[10];
+    if (lid == 0) {
+        for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
+    } else {
+        for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
     }
 
-    // 2. Parallel Inclusive Suffix Scan (S)
+    // 2. Parallel Inclusive Suffix Scan (S), ping-pong in LDS with one barrier/step
+    bool suffix_read_from_s = true;
     for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
         int temp[10];
-        if (lid + stride < WG_SIZE) {
-            fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
-        }
-        barrier();
-        if (lid + stride < WG_SIZE) {
+        if (suffix_read_from_s) {
+            if (lid + stride < WG_SIZE) fe_mul(temp, shared_S[lid], shared_S[lid + stride]);
+            else for (int i = 0; i < 10; i++) temp[i] = shared_S[lid][i];
+            for (int i = 0; i < 10; i++) shared_T[lid][i] = temp[i];
+        } else {
+            if (lid + stride < WG_SIZE) fe_mul(temp, shared_T[lid], shared_T[lid + stride]);
+            else for (int i = 0; i < 10; i++) temp[i] = shared_T[lid][i];
             for (int i = 0; i < 10; i++) shared_S[lid][i] = temp[i];
         }
         barrier();
+        suffix_read_from_s = !suffix_read_from_s;
     }
+    if (!suffix_read_from_s) {
+        for (int i = 0; i < 10; i++) shared_S[lid][i] = shared_T[lid][i];
+    }
+    barrier();
 
     // 3. Last lane computes the only heavy inversion for the workgroup
     if (lid == WG_SIZE - 1u) {
@@ -258,13 +282,6 @@ void main() {
 
     // 4. Extract individual reciprocals
     if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
         int S_excl[10];
         if (lid == WG_SIZE - 1u) {
             for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
@@ -275,11 +292,7 @@ void main() {
         // recip = P_excl * S_excl * total_inv
         int recip[10];
         fe_mul(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_mul(recip, recip, total_inv_local);
+        fe_mul(recip, recip, shared_total_inv);
 
         uint8_t final_pubkey[32];
         ge_p3_tobytes(final_pubkey, R_X, R_Y, recip);
