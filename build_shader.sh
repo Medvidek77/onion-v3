@@ -15,8 +15,9 @@ echo "[2/3] Applying DontInline to fe_sq + fe_mul..."
 spirv-dis "$OUT" -o "$TMP_DIS"
 sed 's/%fe_mul_i1_10__i1_10__i1_10__ = OpFunction %void None /%fe_mul_i1_10__i1_10__i1_10__ = OpFunction %void DontInline /' \
     "$TMP_DIS" > "$TMP_PATCHED"
-sed -i 's/%fe_sq_i1_10__i1_10__ = OpFunction %void None /%fe_sq_i1_10__i1_10__ = OpFunction %void DontInline /' \
-    "$TMP_PATCHED"
+sed 's/%fe_sq_i1_10__i1_10__ = OpFunction %void None /%fe_sq_i1_10__i1_10__ = OpFunction %void DontInline /' \
+    "$TMP_PATCHED" > "${TMP_PATCHED}.2"
+mv "${TMP_PATCHED}.2" "$TMP_PATCHED"
 spirv-as "$TMP_PATCHED" -o "$OUT"
 
 echo "[3/3] Done: $OUT ($(wc -c < $OUT) bytes)"
