@@ -571,7 +571,7 @@ int main(int argc, char** argv) {
 
         vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
 
-        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / 64, 1, 1);
+        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / 256, 1, 1);
         VK_CHECK(vkEndCommandBuffer(commandBuffers[i]));
     }
 
