@@ -10,8 +10,8 @@
  *  - V8: Uses `fe_m` and `fe_s` for the hot paths (forcing inline max ALU performance).
  *  - V8: Retains `fe_mul` and `fe_sq` exclusively for `fe_invert` to protect I-Cache.
  */
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 128u;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+const uint WG_SIZE = 256u;
 
 shared int shared_P[10][WG_SIZE];
 shared int shared_S[10][WG_SIZE];
@@ -337,7 +337,7 @@ void main() {
                 P_curr[i] = shared_P[i][lid];
                 P_prev[i] = shared_P[i][lid - stride];
             }
-            fe_m(temp_P, P_curr, P_prev); // INLINE MAX SPEED
+            fe_mul(temp_P, P_curr, P_prev); // USE DONTINLINE to save VGPR pressure
         }
         
         if (do_S) {
@@ -346,7 +346,7 @@ void main() {
                 S_curr[i] = shared_S[i][lid];
                 S_next[i] = shared_S[i][lid + stride];
             }
-            fe_m(temp_S, S_curr, S_next); // INLINE MAX SPEED
+            fe_mul(temp_S, S_curr, S_next); // USE DONTINLINE to save VGPR pressure
         }
         
         barrier();
@@ -384,15 +384,15 @@ void main() {
         }
 
         int recip[10];
-        fe_m(recip, P_excl, S_excl);
+        fe_mul(recip, P_excl, S_excl);
 
         int total_inv_local[10];
         for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
 
-        fe_m(recip, recip, total_inv_local);
+        fe_mul(recip, recip, total_inv_local);
 
         int final_Y[10];
-        fe_m(final_Y, R_Y, recip);
+        fe_mul(final_Y, R_Y, recip);
 
         if (check_prefix(final_Y)) {
             atomicCompSwap(result_index, -1, int(id));
