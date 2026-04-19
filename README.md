@@ -34,3 +34,5 @@ This will run in batches of 1M keys per kernel execution using the Vulkan comput
 When a match is found, it will generate a tor-compatible folder inside `<output_dir>` containing `hs_ed25519_secret_key`.
 
 You can then copy the generated key directory into your tor's `HiddenServiceDir`.
+
+Performance Note: The latest AMD RX 6800 Golden Build reaches ~95 MH/s using optimized 128 WG size and amortized Montgomery Batch Inversion.
