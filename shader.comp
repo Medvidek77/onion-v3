@@ -27,8 +27,8 @@ layout(std430,set=0,binding=2) buffer ResultBuffer { uint result_count; int resu
 
 struct Pattern {
     uint valid_bytes;
-    uint8_t byte_target[16];
-    uint8_t byte_mask[16];
+    uint byte_target[16];
+    uint byte_mask[16];
 };
 layout(std430,set=0,binding=3) readonly buffer restrict PatternBuffer { Pattern patterns[]; };
 

@@ -1,5 +1,5 @@
 Using Vulkan Device: llvmpipe (LLVM 20.1.2, 256 bits)
 Precomputing 4194304 point additions for GPU... Done.
-Starting search for 2 prefixes via Vulkan...
+Starting search for 1 prefixes via Vulkan...
 
-Checked 4194304 keys | 904572.54 H/s | Found: 0    Checked 8388608 keys | 1338150.83 H/s | Found: 1    Checked 12582912 keys | 1589323.04 H/s | Found: 2    Checked 16777216 keys | 1706408.50 H/s | Found: 3    Checked 20971520 keys | 1741599.56 H/s | Found: 4
+Checked 4194304 keys | 831557.01 H/s | Found: 0    Checked 8388608 keys | 1268386.06 H/s | Found: 1    Checked 12582912 keys | 1540259.80 H/s | Found: 2    Checked 16777216 keys | 1723379.04 H/s | Found: 3    Checked 20971520 keys | 1854776.89 H/s | Found: 4    Checked 25165824 keys | 1954637.96 H/s | Found: 5    Checked 29360128 keys | 2034856.05 H/s | Found: 6    Checked 33554432 keys | 2099527.03 H/s | Found: 7    Checked 37748736 keys | 2152997.98 H/s | Found: 8    Checked 41943040 keys | 2198627.05 H/s | Found: 9    Checked 46137344 keys | 2236984.04 H/s | Found: 10

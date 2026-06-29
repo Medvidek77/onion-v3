@@ -152,14 +152,14 @@ int main(int argc, char** argv) {
     }
 
     if (argc - arg_idx < 2) {
-        printf("Usage: %s [-s] <output_dir> <prefix1> [prefix2] ...\n", argv[0]);
+        printf("Usage: %s [-s] <prefix1> [prefix2] ... <output_dir>\n", argv[0]);
         printf("  -s : Show hashing statistics (H/s)\n");
         return 1;
     }
 
-    const char* out_dir = argv[arg_idx];
+    const char* out_dir = argv[argc - 1];
     int num_prefixes = argc - arg_idx - 1;
-    char** prefixes = &argv[arg_idx + 1];
+    char** prefixes = &argv[arg_idx];
 
     for (int i=0; i<num_prefixes; i++) {
         if (strlen(prefixes[i]) > 16) {
@@ -383,8 +383,8 @@ int main(int argc, char** argv) {
 
     typedef struct {
         uint32_t valid_bytes;
-        uint8_t  byte_target[16];
-        uint8_t  byte_mask[16];
+        uint32_t byte_target[16];
+        uint32_t byte_mask[16];
     } Pattern;
     Pattern patterns[MAX_PREFIXES] = {0};
 
