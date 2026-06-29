@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 22) /* 2,097,152 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 /* Internal CPU structs mapping directly to GPU buffers */
@@ -152,18 +152,20 @@ int main(int argc, char** argv) {
     }
 
     if (argc - arg_idx < 2) {
-        printf("Usage: %s [-s] <prefix> <output_dir>\n", argv[0]);
+        printf("Usage: %s [-s] <output_dir> <prefix1> [prefix2] ...\n", argv[0]);
         printf("  -s : Show hashing statistics (H/s)\n");
         return 1;
     }
 
-    const char* prefix = argv[arg_idx];
-    const char* out_dir = argv[arg_idx + 1];
-    size_t prefix_len = strlen(prefix);
+    const char* out_dir = argv[arg_idx];
+    int num_prefixes = argc - arg_idx - 1;
+    char** prefixes = &argv[arg_idx + 1];
 
-    if (prefix_len > 16) {
-        printf("Prefix too long.\n");
-        return 1;
+    for (int i=0; i<num_prefixes; i++) {
+        if (strlen(prefixes[i]) > 16) {
+            printf("Prefix %s too long (max 16 chars).\n", prefixes[i]);
+            return 1;
+        }
     }
 
     if (sodium_init() < 0) {
@@ -280,7 +282,7 @@ int main(int argc, char** argv) {
     /* Buffers setup */
     size_t basepoint_size = sizeof(gpu_ge_precomp_base);
     size_t offsets_size = BATCH_SIZE * sizeof(gpu_ge_cached);
-    size_t result_size = sizeof(int);
+    size_t result_size = sizeof(uint32_t) + 256 * sizeof(int);
 
     /* Allocate host buffers */
     gpu_ge_precomp_base host_basepoint[2];
@@ -372,42 +374,70 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(device, stagingBuffer, NULL);
     vkFreeMemory(device, stagingMemory, NULL);
 
-    /* Prefix Bitmask (No GPU buffer needed, using push constants) */
-    uint8_t byte_target[16] = {0};
-    uint8_t byte_mask[16] = {0};
-    uint32_t total_bits = prefix_len * 5;
-    uint32_t full_bytes = total_bits / 8;
-    uint32_t remainder_bits = total_bits % 8;
-
-    uint8_t bits[256] = {0};
-    for (size_t i = 0; i < prefix_len; i++) {
-        int val = 0;
-        char c = prefix[i];
-        if (c >= 'a' && c <= 'z') val = c - 'a';
-        else if (c >= '2' && c <= '7') val = c - '2' + 26;
-        for (int b = 4; b >= 0; b--) {
-            bits[i * 5 + (4 - b)] = (val >> b) & 1;
-        }
+    /* Prefix Bitmask handling for multiple prefixes */
+    #define MAX_PREFIXES 256
+    if (num_prefixes > MAX_PREFIXES) {
+        printf("Too many prefixes (max %d)\n", MAX_PREFIXES);
+        return 1;
     }
 
-    uint32_t valid_bytes = full_bytes;
-    for (uint32_t i = 0; i < full_bytes; i++) {
-        for (int b = 0; b < 8; b++) {
-            byte_target[i] |= bits[i * 8 + b] << (7 - b);
-        }
-        byte_mask[i] = 0xFF;
-    }
+    typedef struct {
+        uint32_t valid_bytes;
+        uint8_t  byte_target[16];
+        uint8_t  byte_mask[16];
+    } Pattern;
+    Pattern patterns[MAX_PREFIXES] = {0};
 
-    if (remainder_bits > 0) {
-        uint8_t partial_target = 0;
-        uint8_t partial_mask = 0;
-        for (uint32_t b = 0; b < remainder_bits; b++) {
-            partial_target |= bits[full_bytes * 8 + b] << (7 - b);
-            partial_mask |= 1 << (7 - b);
+    for (int p = 0; p < num_prefixes; p++) {
+        size_t plen = strlen(prefixes[p]);
+        uint32_t total_bits = plen * 5;
+        uint32_t full_bytes = total_bits / 8;
+        uint32_t remainder_bits = total_bits % 8;
+        uint8_t bits[256] = {0};
+        uint8_t bit_mask[256] = {0};
+
+        for (size_t i = 0; i < plen; i++) {
+            int val = 0;
+            char c = prefixes[p][i];
+            if (c == '?') {
+                for (int b = 4; b >= 0; b--) {
+                    bits[i * 5 + (4 - b)] = 0;
+                    bit_mask[i * 5 + (4 - b)] = 0;
+                }
+            } else {
+                if (c >= 'a' && c <= 'z') val = c - 'a';
+                else if (c >= '2' && c <= '7') val = c - '2' + 26;
+                else {
+                    printf("Invalid character in prefix: %c\n", c);
+                    return 1;
+                }
+                for (int b = 4; b >= 0; b--) {
+                    bits[i * 5 + (4 - b)] = (val >> b) & 1;
+                    bit_mask[i * 5 + (4 - b)] = 1;
+                }
+            }
         }
-        byte_target[full_bytes] = partial_target;
-        byte_mask[full_bytes] = partial_mask;
-        valid_bytes++;
+
+        uint32_t v_bytes = full_bytes;
+        for (uint32_t i = 0; i < full_bytes; i++) {
+            for (int b = 0; b < 8; b++) {
+                patterns[p].byte_target[i] |= bits[i * 8 + b] << (7 - b);
+                patterns[p].byte_mask[i] |= bit_mask[i * 8 + b] << (7 - b);
+            }
+        }
+
+        if (remainder_bits > 0) {
+            uint8_t partial_target = 0;
+            uint8_t partial_mask = 0;
+            for (uint32_t b = 0; b < remainder_bits; b++) {
+                partial_target |= bits[full_bytes * 8 + b] << (7 - b);
+                partial_mask |= bit_mask[full_bytes * 8 + b] << (7 - b);
+            }
+            patterns[p].byte_target[full_bytes] = partial_target;
+            patterns[p].byte_mask[full_bytes] = partial_mask;
+            v_bytes++;
+        }
+        patterns[p].valid_bytes = v_bytes;
     }
 
     /* Result buffer (Double Buffered) */
@@ -423,6 +453,23 @@ int main(int argc, char** argv) {
         VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &resultMemory[i]));
         vkBindBufferMemory(device, resultBuffer[i], resultMemory[i], 0);
     }
+
+    /* Patterns Buffer */
+    VkBuffer patternsBuffer;
+    VkDeviceMemory patternsMemory;
+    bufferInfo.size = sizeof(patterns);
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &patternsBuffer));
+    vkGetBufferMemoryRequirements(device, patternsBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &patternsMemory));
+    vkBindBufferMemory(device, patternsBuffer, patternsMemory, 0);
+
+    void* mappedPatterns;
+    VK_CHECK(vkMapMemory(device, patternsMemory, 0, sizeof(patterns), 0, &mappedPatterns));
+    memcpy(mappedPatterns, patterns, sizeof(patterns));
+    vkUnmapMemory(device, patternsMemory);
 
     /* Load shader */
     FILE* f = fopen("shader.spv", "rb");
@@ -452,14 +499,15 @@ int main(int argc, char** argv) {
     free(shaderCode);
 
     /* Descriptor set layout */
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    VkDescriptorSetLayoutBinding bindings[4] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
+        .bindingCount = 4,
         .pBindings = bindings
     };
     VkDescriptorSetLayout descriptorSetLayout;
@@ -467,16 +515,12 @@ int main(int argc, char** argv) {
 
     typedef struct {
         uint32_t batch_size;
-        uint32_t valid_bytes;
-        uint8_t  byte_target[16];
-        uint8_t  byte_mask[16];
+        uint32_t num_patterns;
     } PushConstants;
 
     PushConstants pc_data = {0};
     pc_data.batch_size = BATCH_SIZE;
-    pc_data.valid_bytes = valid_bytes;
-    memcpy(pc_data.byte_target, byte_target, 16);
-    memcpy(pc_data.byte_mask, byte_mask, 16);
+    pc_data.num_patterns = num_prefixes;
 
     /* Pipeline Layout */
     VkPushConstantRange pushConstantRange = {
@@ -536,13 +580,15 @@ int main(int argc, char** argv) {
     for (int i=0; i<2; i++) {
         VkDescriptorBufferInfo baseBufInfo = { basepointBuffer[i], 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo resultBufInfo = { resultBuffer[i], 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo patternsBufInfo = { patternsBuffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet descriptorWrites[3] = {
+        VkWriteDescriptorSet descriptorWrites[4] = {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &patternsBufInfo, NULL }
         };
-        vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
+        vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, NULL);
     }
 
     /* Command Pool & Buffers (Double Buffered) */
@@ -582,7 +628,7 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
 
     if (print_stats) {
-        printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
+        printf("Starting search for %d prefixes via Vulkan...\n\n", num_prefixes);
     }
 
     uint64_t total_checked = 0;
@@ -616,8 +662,8 @@ int main(int argc, char** argv) {
     ge_scalarmult_base(&base_p3, h_scalars[0]);
     convert_p3_to_gpu(&host_basepoint[0], &base_p3);
     memcpy(mappedBasepoint[0], &host_basepoint[0], basepoint_size);
-    int init_res = -1;
-    memcpy(mappedResult[0], &init_res, sizeof(int));
+    uint32_t init_res = 0;
+    memcpy(mappedResult[0], &init_res, sizeof(uint32_t));
 
     vkResetFences(device, 1, &fences[0]);
     VkSubmitInfo subInfo = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &commandBuffers[0] };
@@ -637,8 +683,8 @@ int main(int argc, char** argv) {
         ge_scalarmult_base(&base_p3, h_scalars[next_frame]);
         convert_p3_to_gpu(&host_basepoint[next_frame], &base_p3);
         memcpy(mappedBasepoint[next_frame], &host_basepoint[next_frame], basepoint_size);
-        int init_res2 = -1;
-        memcpy(mappedResult[next_frame], &init_res2, sizeof(int));
+        uint32_t init_res2 = 0;
+        memcpy(mappedResult[next_frame], &init_res2, sizeof(uint32_t));
 
         /* Wait for the CURRENT frame to finish hashing on the GPU */
         VK_CHECK(vkWaitForFences(device, 1, &fences[cur_frame], VK_TRUE, UINT64_MAX));
@@ -755,7 +801,7 @@ int main(int argc, char** argv) {
             }
 
             char path[512];
-            if (snprintf(path, sizeof(path), "%s/%s_keys_%u", out_dir, prefix, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
+            if (snprintf(path, sizeof(path), "%s/keys_%u", out_dir, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
                 continue;
             }
             mkdir(path, 0700);
@@ -782,8 +828,8 @@ int main(int argc, char** argv) {
             }
 
             /* DO NOT exit. Just clear the result index and keep searching. */
-            int clr_res = -1;
-            memcpy(mappedResult[cur_frame], &clr_res, sizeof(int));
+            uint32_t clr_res = 0;
+            memcpy(mappedResult[cur_frame], &clr_res, sizeof(uint32_t));
         }
 
         cur_frame = next_frame;
