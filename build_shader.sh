@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build optimized shader.spv for RX 6800 (RDNA2)
+# Build optimized shader.spv with RDNA2 VGPR optimization
 # Requires: glslangValidator, spirv-dis, spirv-as (from spirv-tools or vulkan-sdk)
 
 set -e
@@ -21,5 +21,4 @@ mv "${TMP_PATCHED}.2" "$TMP_PATCHED"
 spirv-as "$TMP_PATCHED" -o "$OUT"
 
 echo "[3/3] Done: $OUT ($(wc -c < $OUT) bytes)"
-echo "SPIR-V with DontInline on fe_sq+fe_mul → ACO won't inline into fe_invert loops"
-echo "Expected VGPR: ~64-80/thread → 16 waves/SIMD32 → 100% occupancy on RX 6800"
+echo "Info: SPIR-V patched with DontInline on fe_sq and fe_mul to reduce VGPR pressure."
