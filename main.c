@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 22) /* 2,097,152 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 /* Internal CPU structs mapping directly to GPU buffers */
@@ -157,13 +157,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const char* prefix = argv[arg_idx];
-    const char* out_dir = argv[arg_idx + 1];
-    size_t prefix_len = strlen(prefix);
-
-    if (prefix_len > 16) {
-        printf("Prefix too long.\n");
+    int num_patterns = argc - arg_idx - 1;
+    if (num_patterns > 32) {
+        printf("Too many patterns. Max 32 supported.\n");
         return 1;
+    }
+
+    char** patterns = &argv[arg_idx];
+    const char* out_dir = argv[argc - 1];
+
+    size_t max_prefix_len = 0;
+    for (int i=0; i<num_patterns; i++) {
+        size_t len = strlen(patterns[i]);
+        if (len > max_prefix_len) max_prefix_len = len;
+        if (len > 16) {
+            printf("Pattern '%s' too long. Max 16 characters.\n", patterns[i]);
+            return 1;
+        }
     }
 
     if (sodium_init() < 0) {
@@ -372,43 +382,86 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(device, stagingBuffer, NULL);
     vkFreeMemory(device, stagingMemory, NULL);
 
-    /* Prefix Bitmask (No GPU buffer needed, using push constants) */
-    uint8_t byte_target[16] = {0};
-    uint8_t byte_mask[16] = {0};
-    uint32_t total_bits = prefix_len * 5;
-    uint32_t full_bytes = total_bits / 8;
-    uint32_t remainder_bits = total_bits % 8;
+    /* Prefix Bitmasks */
+    uint8_t byte_target[32][16] = {0};
+    uint8_t byte_mask[32][16] = {0};
+    uint32_t valid_bytes[32] = {0};
 
-    uint8_t bits[256] = {0};
-    for (size_t i = 0; i < prefix_len; i++) {
-        int val = 0;
-        char c = prefix[i];
-        if (c >= 'a' && c <= 'z') val = c - 'a';
-        else if (c >= '2' && c <= '7') val = c - '2' + 26;
-        for (int b = 4; b >= 0; b--) {
-            bits[i * 5 + (4 - b)] = (val >> b) & 1;
+    for (int p = 0; p < num_patterns; p++) {
+        size_t plen = strlen(patterns[p]);
+        uint32_t total_bits = plen * 5;
+        uint32_t full_bytes = total_bits / 8;
+        uint32_t remainder_bits = total_bits % 8;
+
+        uint8_t bits_target[256] = {0};
+        uint8_t bits_mask[256] = {0};
+
+        for (size_t i = 0; i < plen; i++) {
+            int val = 0;
+            char c = patterns[p][i];
+            bool wildcard = (c == '?');
+
+            if (!wildcard) {
+                if (c >= 'a' && c <= 'z') val = c - 'a';
+                else if (c >= '2' && c <= '7') val = c - '2' + 26;
+            }
+
+            for (int b = 4; b >= 0; b--) {
+                bits_target[i * 5 + (4 - b)] = (val >> b) & 1;
+                bits_mask[i * 5 + (4 - b)] = wildcard ? 0 : 1;
+            }
         }
+
+        uint32_t vbytes = full_bytes;
+        for (uint32_t i = 0; i < full_bytes; i++) {
+            for (int b = 0; b < 8; b++) {
+                byte_target[p][i] |= bits_target[i * 8 + b] << (7 - b);
+                byte_mask[p][i] |= bits_mask[i * 8 + b] << (7 - b);
+            }
+        }
+
+        if (remainder_bits > 0) {
+            uint8_t partial_target = 0;
+            uint8_t partial_mask = 0;
+            for (uint32_t b = 0; b < remainder_bits; b++) {
+                partial_target |= bits_target[full_bytes * 8 + b] << (7 - b);
+                partial_mask |= bits_mask[full_bytes * 8 + b] << (7 - b);
+            }
+            byte_target[p][full_bytes] = partial_target;
+            byte_mask[p][full_bytes] = partial_mask;
+            vbytes++;
+        }
+        valid_bytes[p] = vbytes;
     }
 
-    uint32_t valid_bytes = full_bytes;
-    for (uint32_t i = 0; i < full_bytes; i++) {
-        for (int b = 0; b < 8; b++) {
-            byte_target[i] |= bits[i * 8 + b] << (7 - b);
-        }
-        byte_mask[i] = 0xFF;
-    }
+    /* Patterns buffer */
+    VkBuffer patternBuffer;
+    VkDeviceMemory patternMemory;
+    size_t pattern_size = sizeof(uint8_t) * 16 * 2 * 32 + sizeof(uint32_t) * 32;
+    bufferInfo.size = pattern_size;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &patternBuffer));
+    vkGetBufferMemoryRequirements(device, patternBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &patternMemory));
+    vkBindBufferMemory(device, patternBuffer, patternMemory, 0);
 
-    if (remainder_bits > 0) {
-        uint8_t partial_target = 0;
-        uint8_t partial_mask = 0;
-        for (uint32_t b = 0; b < remainder_bits; b++) {
-            partial_target |= bits[full_bytes * 8 + b] << (7 - b);
-            partial_mask |= 1 << (7 - b);
-        }
-        byte_target[full_bytes] = partial_target;
-        byte_mask[full_bytes] = partial_mask;
-        valid_bytes++;
+    void* mappedPattern;
+    vkMapMemory(device, patternMemory, 0, pattern_size, 0, &mappedPattern);
+    struct Pattern {
+        uint32_t valid_bytes;
+        uint8_t target[16];
+        uint8_t mask[16];
+    };
+    struct Pattern gpu_patterns[32] = {0};
+    for (int p=0; p<num_patterns; p++) {
+        gpu_patterns[p].valid_bytes = valid_bytes[p];
+        memcpy(gpu_patterns[p].target, byte_target[p], 16);
+        memcpy(gpu_patterns[p].mask, byte_mask[p], 16);
     }
+    memcpy(mappedPattern, gpu_patterns, sizeof(struct Pattern) * num_patterns);
+    vkUnmapMemory(device, patternMemory);
 
     /* Result buffer (Double Buffered) */
     bufferInfo.size = result_size;
@@ -452,31 +505,34 @@ int main(int argc, char** argv) {
     free(shaderCode);
 
     /* Descriptor set layout */
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    VkDescriptorSetLayoutBinding bindings[4] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
+        .bindingCount = 4,
         .pBindings = bindings
     };
+    bindings[3].binding = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[3].pImmutableSamplers = NULL;
+
+    layoutInfo.bindingCount = 4;
     VkDescriptorSetLayout descriptorSetLayout;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &descriptorSetLayout));
 
     typedef struct {
         uint32_t batch_size;
-        uint32_t valid_bytes;
-        uint8_t  byte_target[16];
-        uint8_t  byte_mask[16];
+        uint32_t pattern_count;
     } PushConstants;
 
     PushConstants pc_data = {0};
     pc_data.batch_size = BATCH_SIZE;
-    pc_data.valid_bytes = valid_bytes;
-    memcpy(pc_data.byte_target, byte_target, 16);
-    memcpy(pc_data.byte_mask, byte_mask, 16);
+    pc_data.pattern_count = num_patterns;
 
     /* Pipeline Layout */
     VkPushConstantRange pushConstantRange = {
@@ -510,7 +566,7 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &computePipeline));
 
     /* Descriptor Pool (Double Buffered) */
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10 };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 2,
@@ -537,12 +593,14 @@ int main(int argc, char** argv) {
         VkDescriptorBufferInfo baseBufInfo = { basepointBuffer[i], 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo resultBufInfo = { resultBuffer[i], 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet descriptorWrites[3] = {
+        VkDescriptorBufferInfo patternBufInfo = { patternBuffer, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet descriptorWrites[4] = {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &patternBufInfo, NULL }
         };
-        vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
+        vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, NULL);
     }
 
     /* Command Pool & Buffers (Double Buffered) */
@@ -582,7 +640,7 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
 
     if (print_stats) {
-        printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
+        printf("Starting search for %d prefixes via Vulkan...\n\n", num_patterns);
     }
 
     uint64_t total_checked = 0;
@@ -755,7 +813,7 @@ int main(int argc, char** argv) {
             }
 
             char path[512];
-            if (snprintf(path, sizeof(path), "%s/%s_keys_%u", out_dir, prefix, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
+            if (snprintf(path, sizeof(path), "%s/match_keys_%u", out_dir, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
                 continue;
             }
             mkdir(path, 0700);
@@ -816,6 +874,9 @@ int main(int argc, char** argv) {
 
     vkDestroyBuffer(device, offsetsBuffer, NULL);
     vkFreeMemory(device, offsetsMemory, NULL);
+
+    vkDestroyBuffer(device, patternBuffer, NULL);
+    vkFreeMemory(device, patternMemory, NULL);
 
     vkDestroyDevice(device, NULL);
     vkDestroyInstance(instance, NULL);
