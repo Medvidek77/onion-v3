@@ -21,9 +21,9 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 22) /* 2,097,152 */
+#define BATCH_SIZE (1 << 19) /* 2,097,152 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 /* Internal CPU structs mapping directly to GPU buffers */
