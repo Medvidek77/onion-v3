@@ -383,6 +383,7 @@ int main(int argc, char** argv) {
 
     typedef struct {
         uint32_t valid_bytes;
+        uint32_t _padding[3]; /* GLSL std430 array alignment padding */
         uint32_t byte_target[4];
         uint32_t byte_mask[4];
     } Pattern;
@@ -805,7 +806,7 @@ int main(int argc, char** argv) {
             }
 
             char path[512];
-            if (snprintf(path, sizeof(path), "%s/keys_%u", out_dir, (uint32_t)(total_checked/BATCH_SIZE)) >= (int)sizeof(path)) {
+            if (snprintf(path, sizeof(path), "%s/keys_%u_%u", out_dir, (uint32_t)(total_checked/BATCH_SIZE), r) >= (int)sizeof(path)) {
                 continue;
             }
             mkdir(path, 0700);

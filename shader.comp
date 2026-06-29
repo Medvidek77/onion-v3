@@ -27,6 +27,7 @@ layout(std430,set=0,binding=2) buffer ResultBuffer { uint result_count; int resu
 
 struct Pattern {
     uint valid_bytes;
+    uint _padding[3];
     uint byte_target[4];
     uint byte_mask[4];
 };
