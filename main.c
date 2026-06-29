@@ -21,12 +21,12 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 22) // 2,097,152
-#define NUM_THREADS 12       // Max CPU threads for Ryzen 5 5600
+#define BATCH_SIZE (1 << 22) /* 2,097,152 */
+#define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
 #define WORKGROUP_SIZE 128
 
 
-// Internal CPU structs mapping directly to GPU buffers
+/* Internal CPU structs mapping directly to GPU buffers */
 typedef struct {
     int32_t X[10];
     int32_t Y[10];
@@ -102,28 +102,28 @@ void generate_offsets(gpu_ge_cached* offsets, uint32_t count) {
     printf("Precomputing %u point additions for GPU... ", count);
     fflush(stdout);
 
-    // We want offsets O[i] = i * 8 * G
-    // G is the base point
+    /* We want offsets O[i] = i * 8 * G */
+    /* G is the base point */
     ge_p3 G, cur_p3;
     const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-    ge_scalarmult_base(&G, one); // G
+    ge_scalarmult_base(&G, one); /* G */
 
-    // Calculate 8*G
+    /* Calculate 8*G */
     ge_p1p1 p1;
     ge_p2 p2;
     ge_p3_to_p2(&p2, &G);
-    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); // 2G
+    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); /* 2G */
     ge_p3_to_p2(&p2, &cur_p3);
-    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); // 4G
+    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); /* 4G */
     ge_p3_to_p2(&p2, &cur_p3);
-    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); // 8G
+    ge_p2_dbl(&p1, &p2); ge_p1p1_to_p3(&cur_p3, &p1); /* 8G */
 
     ge_p3 step_p3 = cur_p3;
     ge_cached step_cached;
     ge_p3_to_cached(&step_cached, &step_p3);
 
     ge_p3 sum;
-    ge_p3_0(&sum); // Start at 0*G
+    ge_p3_0(&sum); /* Start at 0*G */
 
     for (uint32_t i = 0; i < count; i++) {
         ge_cached c;
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
 
     mkdir(out_dir, 0700);
 
-    // Vulkan Initialization
+    /* Vulkan Initialization */
     VkApplicationInfo appInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "TorVanityVulkan",
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
     VkPhysicalDevice* physicalDevices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
     vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices);
 
-    // Attempt to prefer Discrete GPUs, fallback to first available
+    /* Attempt to prefer Discrete GPUs, fallback to first available */
     VkPhysicalDevice physicalDevice = physicalDevices[0];
     for (uint32_t i = 0; i < deviceCount; i++) {
         VkPhysicalDeviceProperties props;
@@ -277,12 +277,12 @@ int main(int argc, char** argv) {
     VkQueue computeQueue;
     vkGetDeviceQueue(device, computeFamily, 0, &computeQueue);
 
-    // Buffers setup
+    /* Buffers setup */
     size_t basepoint_size = sizeof(gpu_ge_precomp_base);
     size_t offsets_size = BATCH_SIZE * sizeof(gpu_ge_cached);
     size_t result_size = sizeof(int);
 
-    // Allocate host buffers
+    /* Allocate host buffers */
     gpu_ge_precomp_base host_basepoint[2];
     gpu_ge_cached* host_offsets = malloc(offsets_size);
     generate_offsets(host_offsets, BATCH_SIZE);
@@ -291,7 +291,7 @@ int main(int argc, char** argv) {
     VkMemoryAllocateInfo allocInfo = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     VkMemoryRequirements memReqs;
 
-    // BasePoint buffers (Double Buffered)
+    /* BasePoint buffers (Double Buffered) */
     bufferInfo.size = basepoint_size;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
         vkBindBufferMemory(device, basepointBuffer[i], basepointMemory[i], 0);
     }
 
-    // Transfer Command Pool
+    /* Transfer Command Pool */
     VkCommandPoolCreateInfo cmdPoolInfoTrans = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .queueFamilyIndex = computeFamily,
@@ -315,7 +315,7 @@ int main(int argc, char** argv) {
     VkCommandPool transferPool;
     VK_CHECK(vkCreateCommandPool(device, &cmdPoolInfoTrans, NULL, &transferPool));
 
-    // Offsets buffer (Staging -> Device Local)
+    /* Offsets buffer (Staging -> Device Local) */
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingMemory;
     bufferInfo.size = offsets_size;
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
     vkGetBufferMemoryRequirements(device, offsetsBuffer, &memReqs);
     allocInfo.allocationSize = memReqs.size;
 
-    // Try DEVICE_LOCAL. If it fails (e.g. llvmpipe without dedicated memory), fall back to HOST_VISIBLE.
+    /* Try DEVICE_LOCAL. If it fails (e.g. llvmpipe without dedicated memory), fall back to HOST_VISIBLE. */
     uint32_t memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (memTypeIndex == (uint32_t)-1) {
         memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -372,7 +372,7 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(device, stagingBuffer, NULL);
     vkFreeMemory(device, stagingMemory, NULL);
 
-    // Prefix Bitmask (No GPU buffer needed, using push constants)
+    /* Prefix Bitmask (No GPU buffer needed, using push constants) */
     uint8_t byte_target[16] = {0};
     uint8_t byte_mask[16] = {0};
     uint32_t total_bits = prefix_len * 5;
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
         valid_bytes++;
     }
 
-    // Result buffer (Double Buffered)
+    /* Result buffer (Double Buffered) */
     bufferInfo.size = result_size;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     VkBuffer resultBuffer[2];
@@ -424,7 +424,7 @@ int main(int argc, char** argv) {
         vkBindBufferMemory(device, resultBuffer[i], resultMemory[i], 0);
     }
 
-    // Load shader
+    /* Load shader */
     FILE* f = fopen("shader.spv", "rb");
     if (!f) {
         fprintf(stderr, "Failed to open shader.spv. Did you compile it?\n");
@@ -451,7 +451,7 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateShaderModule(device, &shaderInfo, NULL, &computeShaderModule));
     free(shaderCode);
 
-    // Descriptor set layout
+    /* Descriptor set layout */
     VkDescriptorSetLayoutBinding bindings[3] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -478,7 +478,7 @@ int main(int argc, char** argv) {
     memcpy(pc_data.byte_target, byte_target, 16);
     memcpy(pc_data.byte_mask, byte_mask, 16);
 
-    // Pipeline Layout
+    /* Pipeline Layout */
     VkPushConstantRange pushConstantRange = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -495,7 +495,7 @@ int main(int argc, char** argv) {
     VkPipelineLayout pipelineLayout;
     VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, NULL, &pipelineLayout));
 
-    // Compute Pipeline
+    /* Compute Pipeline */
     VkComputePipelineCreateInfo pipelineInfo = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {
@@ -509,7 +509,7 @@ int main(int argc, char** argv) {
     VkPipeline computePipeline;
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &computePipeline));
 
-    // Descriptor Pool (Double Buffered)
+    /* Descriptor Pool (Double Buffered) */
     VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -520,7 +520,7 @@ int main(int argc, char** argv) {
     VkDescriptorPool descriptorPool;
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, NULL, &descriptorPool));
 
-    // Descriptor Sets
+    /* Descriptor Sets */
     VkDescriptorSetLayout layouts[2] = { descriptorSetLayout, descriptorSetLayout };
     VkDescriptorSetAllocateInfo allocSetInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -545,7 +545,7 @@ int main(int argc, char** argv) {
         vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
     }
 
-    // Command Pool & Buffers (Double Buffered)
+    /* Command Pool & Buffers (Double Buffered) */
     VkCommandPoolCreateInfo cmdPoolInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -563,7 +563,7 @@ int main(int argc, char** argv) {
     VkCommandBuffer commandBuffers[2];
     VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, commandBuffers));
 
-    // Record Command Buffers
+    /* Record Command Buffers */
     for (int i=0; i<2; i++) {
         VkCommandBufferBeginInfo beginInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         VK_CHECK(vkBeginCommandBuffer(commandBuffers[i], &beginInfo));
@@ -604,12 +604,12 @@ int main(int argc, char** argv) {
 
     int cur_frame = 0;
 
-    // Prefill frame 0
+    /* Prefill frame 0 */
     randombytes_buf(base_secret[0], 32);
     crypto_hash_sha512(h_scalars[0], base_secret[0], 32);
     h_scalars[0][0] &= 248; h_scalars[0][31] &= 127; h_scalars[0][31] |= 64;
 
-    // We MUST reduce the scalar mod L so sc_muladd works properly later!
+    /* We MUST reduce the scalar mod L so sc_muladd works properly later! */
     sc_reduce(h_scalars[0]);
 
     ge_p3 base_p3;
@@ -626,12 +626,12 @@ int main(int argc, char** argv) {
     while (!found) {
         int next_frame = 1 - cur_frame;
 
-        // Asynchronously prepare the NEXT frame on the CPU
+        /* Asynchronously prepare the NEXT frame on the CPU */
         randombytes_buf(base_secret[next_frame], 32);
         crypto_hash_sha512(h_scalars[next_frame], base_secret[next_frame], 32);
         h_scalars[next_frame][0] &= 248; h_scalars[next_frame][31] &= 127; h_scalars[next_frame][31] |= 64;
 
-        // We MUST reduce the scalar mod L so sc_muladd works properly later!
+        /* We MUST reduce the scalar mod L so sc_muladd works properly later! */
         sc_reduce(h_scalars[next_frame]);
 
         ge_scalarmult_base(&base_p3, h_scalars[next_frame]);
@@ -640,15 +640,15 @@ int main(int argc, char** argv) {
         int init_res2 = -1;
         memcpy(mappedResult[next_frame], &init_res2, sizeof(int));
 
-        // Wait for the CURRENT frame to finish hashing on the GPU
+        /* Wait for the CURRENT frame to finish hashing on the GPU */
         VK_CHECK(vkWaitForFences(device, 1, &fences[cur_frame], VK_TRUE, UINT64_MAX));
 
-        // Immediately submit the NEXT frame so the GPU doesn't stall while we check the results of the current frame
+        /* Immediately submit the NEXT frame so the GPU doesn't stall while we check the results of the current frame */
         vkResetFences(device, 1, &fences[next_frame]);
         VkSubmitInfo subInfo2 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &commandBuffers[next_frame] };
         VK_CHECK(vkQueueSubmit(computeQueue, 1, &subInfo2, fences[next_frame]));
 
-        // Check results of the CURRENT frame
+        /* Check results of the CURRENT frame */
         int result_index;
         memcpy(&result_index, mappedResult[cur_frame], sizeof(int));
 
@@ -667,9 +667,9 @@ int main(int argc, char** argv) {
         if (result_index != -1) {
             found_count++;
             unsigned char* h = h_scalars[cur_frame];
-            // To get the actual secret, we take our base scalar `h`
-            // and add `result_index * 8` to it.
-            // We use sc_muladd to safely add in the scalar field.
+            /* To get the actual secret, we take our base scalar `h` */
+            /* and add `result_index * 8` to it. */
+            /* We use sc_muladd to safely add in the scalar field. */
             unsigned char offset_scalar[32] = {0};
             uint32_t offset_val = result_index * 8;
             offset_scalar[0] = (offset_val >> 0) & 0xff;
@@ -678,30 +678,30 @@ int main(int argc, char** argv) {
             offset_scalar[3] = (offset_val >> 24) & 0xff;
 
             unsigned char final_scalar[32];
-            // In orlp/ed25519 (ref10), sc_muladd(s, a, b, c) calculates s = (a * b + c) mod L
-            // We want h + offset_scalar. So a = offset_scalar, b = 1, c = h
+            /* In orlp/ed25519 (ref10), sc_muladd(s, a, b, c) calculates s = (a * b + c) mod L */
+            /* We want h + offset_scalar. So a = offset_scalar, b = 1, c = h */
             const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
             sc_muladd(final_scalar, offset_scalar, one, h);
 
-            // We need the matching public key to save it in Tor format
+            /* We need the matching public key to save it in Tor format */
             ge_p3 match_p3;
             ge_scalarmult_base(&match_p3, final_scalar);
             unsigned char match_pubkey[32];
             ge_p3_tobytes(match_pubkey, &match_p3);
 
-            // Compute the checksum and build the full onion string using pure SHA3-256
+            /* Compute the checksum and build the full onion string using pure SHA3-256 */
             unsigned char checksum_input[50];
             memcpy(checksum_input, ".onion checksum", 15);
             memcpy(checksum_input + 15, match_pubkey, 32);
             checksum_input[47] = 0x03;
 
-            // Minimal Keccak-f[1600] / SHA3-256
+            /* Minimal Keccak-f[1600] / SHA3-256 */
             uint64_t state[25] = {0};
             for (int i = 0; i < 48; i++) ((uint8_t*)state)[i] ^= checksum_input[i];
             ((uint8_t*)state)[48] ^= 0x06;
             ((uint8_t*)state)[135] ^= 0x80;
 
-            // Keccak-f[1600] rounds
+            /* Keccak-f[1600] rounds */
             const uint64_t RC[24] = {
                 0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
                 0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
@@ -781,7 +781,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // DO NOT exit. Just clear the result index and keep searching.
+            /* DO NOT exit. Just clear the result index and keep searching. */
             int clr_res = -1;
             memcpy(mappedResult[cur_frame], &clr_res, sizeof(int));
         }
@@ -796,7 +796,7 @@ int main(int argc, char** argv) {
         vkUnmapMemory(device, resultMemory[i]);
     }
 
-    // Cleanup
+    /* Cleanup */
     free(host_offsets);
 
     vkDestroyCommandPool(device, commandPool, NULL);
