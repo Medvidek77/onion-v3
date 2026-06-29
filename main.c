@@ -383,8 +383,8 @@ int main(int argc, char** argv) {
 
     typedef struct {
         uint32_t valid_bytes;
-        uint32_t byte_target[16];
-        uint32_t byte_mask[16];
+        uint32_t byte_target[4];
+        uint32_t byte_mask[4];
     } Pattern;
     Pattern patterns[MAX_PREFIXES] = {0};
 
@@ -420,21 +420,25 @@ int main(int argc, char** argv) {
 
         uint32_t v_bytes = full_bytes;
         for (uint32_t i = 0; i < full_bytes; i++) {
+            uint32_t t = 0;
+            uint32_t m = 0;
             for (int b = 0; b < 8; b++) {
-                patterns[p].byte_target[i] |= bits[i * 8 + b] << (7 - b);
-                patterns[p].byte_mask[i] |= bit_mask[i * 8 + b] << (7 - b);
+                t |= bits[i * 8 + b] << (7 - b);
+                m |= bit_mask[i * 8 + b] << (7 - b);
             }
+            patterns[p].byte_target[i/4] |= t << ((i%4)*8);
+            patterns[p].byte_mask[i/4] |= m << ((i%4)*8);
         }
 
         if (remainder_bits > 0) {
-            uint8_t partial_target = 0;
-            uint8_t partial_mask = 0;
+            uint32_t partial_target = 0;
+            uint32_t partial_mask = 0;
             for (uint32_t b = 0; b < remainder_bits; b++) {
                 partial_target |= bits[full_bytes * 8 + b] << (7 - b);
                 partial_mask |= bit_mask[full_bytes * 8 + b] << (7 - b);
             }
-            patterns[p].byte_target[full_bytes] = partial_target;
-            patterns[p].byte_mask[full_bytes] = partial_mask;
+            patterns[p].byte_target[full_bytes/4] |= partial_target << ((full_bytes%4)*8);
+            patterns[p].byte_mask[full_bytes/4] |= partial_mask << ((full_bytes%4)*8);
             v_bytes++;
         }
         patterns[p].valid_bytes = v_bytes;

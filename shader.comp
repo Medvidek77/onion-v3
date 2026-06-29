@@ -27,8 +27,8 @@ layout(std430,set=0,binding=2) buffer ResultBuffer { uint result_count; int resu
 
 struct Pattern {
     uint valid_bytes;
-    uint byte_target[16];
-    uint byte_mask[16];
+    uint byte_target[4];
+    uint byte_mask[4];
 };
 layout(std430,set=0,binding=3) readonly buffer restrict PatternBuffer { Pattern patterns[]; };
 
@@ -261,7 +261,9 @@ bool check_prefix(in int h[10]) {
         bool match = true;
         for (uint i = 0; i < 16; i++) {
             if (i < patterns[p].valid_bytes) {
-                match = match && ((out_bytes[i] & patterns[p].byte_mask[i]) == patterns[p].byte_target[i]);
+                uint target = (patterns[p].byte_target[i/4] >> ((i%4)*8)) & 0xffu;
+                uint mask = (patterns[p].byte_mask[i/4] >> ((i%4)*8)) & 0xffu;
+                match = match && ((uint(out_bytes[i]) & mask) == target);
             }
         }
         any_match = any_match || match;
