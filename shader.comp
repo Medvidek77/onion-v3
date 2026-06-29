@@ -10,17 +10,13 @@
  * - fe_m/fe_s are used for hot paths to force inline and maximize ALU performance
  * - fe_mul/fe_sq are retained exclusively for fe_invert to protect instruction cache
  */
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 128u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+const uint WG_SIZE = 64u;
 
-shared int shared_P[10][WG_SIZE];
-shared int shared_S[10][WG_SIZE];
+shared int shared_P[WG_SIZE][10];
+shared int shared_S[WG_SIZE][10];
 shared int shared_total_inv[10];
 
-shared int s_base_YplusX[10];
-shared int s_base_YminusX[10];
-shared int s_base_Z2[10];
-shared int s_base_T[10];
 
 struct ge_precomp_base { int YplusX[10]; int YminusX[10]; int Z2[10]; int T[10]; };
 struct ge_cached       { int YplusX[10]; int YminusX[10]; int Z[10];  int T2d[10]; };
@@ -172,12 +168,12 @@ void ge_madd_precomp_YZ(out int r_Y[10],out int r_Z[10],
     int t1[10], t2[10];
     
     /* using inline variant */
-    fe_m(t1, s_base_YplusX, q_YplusX);   
-    fe_m(t2, s_base_YminusX, q_YminusX); 
+    fe_m(t1, base_point.YplusX, q_YplusX);
+    fe_m(t2, base_point.YminusX, q_YminusX);
     fe_add(r_Y, t1, t2);              
     
-    fe_m(t1, q_T2d, s_base_T);           
-    fe_m(t2, s_base_Z2, q_Z);            
+    fe_m(t1, q_T2d, base_point.T);
+    fe_m(t2, base_point.Z2, q_Z);
     
     fe_sub(r_Z, t2, t1);              
     fe_add(t2, t2, t1);               
@@ -296,15 +292,7 @@ void main() {
     uint id = gl_GlobalInvocationID.x;
     uint lid = gl_LocalInvocationID.x;
 
-    if (lid == 0) {
-        for(int i=0; i<10; i++) {
-            s_base_YplusX[i] = base_point.YplusX[i];
-            s_base_YminusX[i] = base_point.YminusX[i];
-            s_base_Z2[i] = base_point.Z2[i];
-            s_base_T[i] = base_point.T[i];
-        }
-    }
-    barrier();
+
 
     int R_Y[10], R_Z[10];
 
@@ -313,14 +301,14 @@ void main() {
                            offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
 
         for (int i = 0; i < 10; i++) {
-            shared_P[i][lid] = R_Z[i];
-            shared_S[i][lid] = R_Z[i];
+            shared_P[lid][i] = R_Z[i];
+            shared_S[lid][i] = R_Z[i];
         }
     } else {
         int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
         for (int i = 0; i < 10; i++) {
-            shared_P[i][lid] = one[i];
-            shared_S[i][lid] = one[i];
+            shared_P[lid][i] = one[i];
+            shared_S[lid][i] = one[i];
         }
     }
     barrier();
@@ -333,8 +321,8 @@ void main() {
         if (do_P) {
             int P_curr[10], P_prev[10];
             for (int i = 0; i < 10; i++) {
-                P_curr[i] = shared_P[i][lid];
-                P_prev[i] = shared_P[i][lid - stride];
+                P_curr[i] = shared_P[lid][i];
+                P_prev[i] = shared_P[lid - stride][i];
             }
             fe_m(temp_P, P_curr, P_prev); /* inlined */
         }
@@ -342,8 +330,8 @@ void main() {
         if (do_S) {
             int S_curr[10], S_next[10];
             for (int i = 0; i < 10; i++) {
-                S_curr[i] = shared_S[i][lid];
-                S_next[i] = shared_S[i][lid + stride];
+                S_curr[i] = shared_S[lid][i];
+                S_next[i] = shared_S[lid + stride][i];
             }
             fe_m(temp_S, S_curr, S_next); /* inlined */
         }
@@ -351,10 +339,10 @@ void main() {
         barrier();
 
         if (do_P) {
-            for (int i = 0; i < 10; i++) shared_P[i][lid] = temp_P[i];
+            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp_P[i];
         }
         if (do_S) {
-            for (int i = 0; i < 10; i++) shared_S[i][lid] = temp_S[i];
+            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp_S[i];
         }
         
         barrier();
@@ -362,7 +350,7 @@ void main() {
 
     if (lid == WG_SIZE - 1u) {
         int last_P[10];
-        for (int i = 0; i < 10; i++) last_P[i] = shared_P[i][WG_SIZE - 1u];
+        for (int i = 0; i < 10; i++) last_P[i] = shared_P[WG_SIZE - 1u][i];
         fe_invert(shared_total_inv, last_P);
     }
     barrier();
@@ -372,14 +360,14 @@ void main() {
         if (lid == 0) {
             for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
         } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[i][lid - 1];
+            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
         }
 
         int S_excl[10];
         if (lid == WG_SIZE - 1u) {
             for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
         } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[i][lid + 1];
+            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
         }
 
         int recip[10];
