@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 22) /* 2,097,152 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 /* Internal CPU structs mapping directly to GPU buffers */
@@ -373,29 +373,40 @@ int main(int argc, char** argv) {
     vkFreeMemory(device, stagingMemory, NULL);
 
     /* Prefix Bitmask (No GPU buffer needed, using push constants) */
-    uint8_t byte_target[16] = {0};
-    uint8_t byte_mask[16] = {0};
+    uint8_t byte_target_array[16] = {0};
+    uint8_t byte_mask_array[16] = {0};
     uint32_t total_bits = prefix_len * 5;
     uint32_t full_bytes = total_bits / 8;
     uint32_t remainder_bits = total_bits % 8;
 
     uint8_t bits[256] = {0};
+    uint8_t mask_bits[256] = {0};
     for (size_t i = 0; i < prefix_len; i++) {
         int val = 0;
         char c = prefix[i];
-        if (c >= 'a' && c <= 'z') val = c - 'a';
-        else if (c >= '2' && c <= '7') val = c - '2' + 26;
-        for (int b = 4; b >= 0; b--) {
-            bits[i * 5 + (4 - b)] = (val >> b) & 1;
+        if (c != '?') {
+            if (c >= 'a' && c <= 'z') val = c - 'a';
+            else if (c >= '2' && c <= '7') val = c - '2' + 26;
+            for (int b = 4; b >= 0; b--) {
+                bits[i * 5 + (4 - b)] = (val >> b) & 1;
+                mask_bits[i * 5 + (4 - b)] = 1;
+            }
+        } else {
+            for (int b = 4; b >= 0; b--) {
+                bits[i * 5 + (4 - b)] = 0;
+                mask_bits[i * 5 + (4 - b)] = 0;
+            }
         }
     }
 
     uint32_t valid_bytes = full_bytes;
     for (uint32_t i = 0; i < full_bytes; i++) {
+        byte_target_array[i] = 0;
+        byte_mask_array[i] = 0;
         for (int b = 0; b < 8; b++) {
-            byte_target[i] |= bits[i * 8 + b] << (7 - b);
+            byte_target_array[i] |= bits[i * 8 + b] << (7 - b);
+            byte_mask_array[i] |= mask_bits[i * 8 + b] << (7 - b);
         }
-        byte_mask[i] = 0xFF;
     }
 
     if (remainder_bits > 0) {
@@ -403,10 +414,10 @@ int main(int argc, char** argv) {
         uint8_t partial_mask = 0;
         for (uint32_t b = 0; b < remainder_bits; b++) {
             partial_target |= bits[full_bytes * 8 + b] << (7 - b);
-            partial_mask |= 1 << (7 - b);
+            partial_mask |= mask_bits[full_bytes * 8 + b] << (7 - b);
         }
-        byte_target[full_bytes] = partial_target;
-        byte_mask[full_bytes] = partial_mask;
+        byte_target_array[full_bytes] = partial_target;
+        byte_mask_array[full_bytes] = partial_mask;
         valid_bytes++;
     }
 
@@ -475,8 +486,8 @@ int main(int argc, char** argv) {
     PushConstants pc_data = {0};
     pc_data.batch_size = BATCH_SIZE;
     pc_data.valid_bytes = valid_bytes;
-    memcpy(pc_data.byte_target, byte_target, 16);
-    memcpy(pc_data.byte_mask, byte_mask, 16);
+    memcpy(pc_data.byte_target, byte_target_array, 16);
+    memcpy(pc_data.byte_mask, byte_mask_array, 16);
 
     /* Pipeline Layout */
     VkPushConstantRange pushConstantRange = {
