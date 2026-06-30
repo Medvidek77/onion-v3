@@ -10,8 +10,8 @@
  * - fe_m/fe_s are used for hot paths to force inline and maximize ALU performance
  * - fe_mul/fe_sq are retained exclusively for fe_invert to protect instruction cache
  */
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 128u;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+const uint WG_SIZE = 256u;
 
 shared int shared_P[10][WG_SIZE];
 shared int shared_S[10][WG_SIZE];
