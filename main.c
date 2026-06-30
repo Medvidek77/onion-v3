@@ -468,15 +468,29 @@ int main(int argc, char** argv) {
     typedef struct {
         uint32_t batch_size;
         uint32_t valid_bytes;
-        uint8_t  byte_target[16];
-        uint8_t  byte_mask[16];
+        uint32_t target_0_3;
+        uint32_t target_4_7;
+        uint32_t target_8_11;
+        uint32_t target_12_15;
+        uint32_t mask_0_3;
+        uint32_t mask_4_7;
+        uint32_t mask_8_11;
+        uint32_t mask_12_15;
     } PushConstants;
 
     PushConstants pc_data = {0};
     pc_data.batch_size = BATCH_SIZE;
     pc_data.valid_bytes = valid_bytes;
-    memcpy(pc_data.byte_target, byte_target, 16);
-    memcpy(pc_data.byte_mask, byte_mask, 16);
+
+    pc_data.target_0_3 = byte_target[0] | ((uint32_t)byte_target[1] << 8) | ((uint32_t)byte_target[2] << 16) | ((uint32_t)byte_target[3] << 24);
+    pc_data.target_4_7 = byte_target[4] | ((uint32_t)byte_target[5] << 8) | ((uint32_t)byte_target[6] << 16) | ((uint32_t)byte_target[7] << 24);
+    pc_data.target_8_11 = byte_target[8] | ((uint32_t)byte_target[9] << 8) | ((uint32_t)byte_target[10] << 16) | ((uint32_t)byte_target[11] << 24);
+    pc_data.target_12_15 = byte_target[12] | ((uint32_t)byte_target[13] << 8) | ((uint32_t)byte_target[14] << 16) | ((uint32_t)byte_target[15] << 24);
+
+    pc_data.mask_0_3 = byte_mask[0] | ((uint32_t)byte_mask[1] << 8) | ((uint32_t)byte_mask[2] << 16) | ((uint32_t)byte_mask[3] << 24);
+    pc_data.mask_4_7 = byte_mask[4] | ((uint32_t)byte_mask[5] << 8) | ((uint32_t)byte_mask[6] << 16) | ((uint32_t)byte_mask[7] << 24);
+    pc_data.mask_8_11 = byte_mask[8] | ((uint32_t)byte_mask[9] << 8) | ((uint32_t)byte_mask[10] << 16) | ((uint32_t)byte_mask[11] << 24);
+    pc_data.mask_12_15 = byte_mask[12] | ((uint32_t)byte_mask[13] << 8) | ((uint32_t)byte_mask[14] << 16) | ((uint32_t)byte_mask[15] << 24);
 
     /* Pipeline Layout */
     VkPushConstantRange pushConstantRange = {
