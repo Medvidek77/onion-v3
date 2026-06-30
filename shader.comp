@@ -10,8 +10,8 @@
  * - fe_m/fe_s are used for hot paths to force inline and maximize ALU performance
  * - fe_mul/fe_sq are retained exclusively for fe_invert to protect instruction cache
  */
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 128u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+const uint WG_SIZE = 64u;
 
 shared int shared_P[10][WG_SIZE];
 shared int shared_S[10][WG_SIZE];
@@ -325,10 +325,10 @@ void main() {
     }
     barrier();
 
+    /* Split P and S into separate loops to halve VGPR pressure (RDNA2 optimization) */
     for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp_P[10], temp_S[10];
+        int temp_P[10];
         bool do_P = (lid >= stride);
-        bool do_S = (lid + stride < WG_SIZE);
 
         if (do_P) {
             int P_curr[10], P_prev[10];
@@ -339,6 +339,19 @@ void main() {
             fe_m(temp_P, P_curr, P_prev); /* inlined */
         }
         
+        barrier();
+
+        if (do_P) {
+            for (int i = 0; i < 10; i++) shared_P[i][lid] = temp_P[i];
+        }
+
+        barrier();
+    }
+
+    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
+        int temp_S[10];
+        bool do_S = (lid + stride < WG_SIZE);
+
         if (do_S) {
             int S_curr[10], S_next[10];
             for (int i = 0; i < 10; i++) {
@@ -350,9 +363,6 @@ void main() {
         
         barrier();
 
-        if (do_P) {
-            for (int i = 0; i < 10; i++) shared_P[i][lid] = temp_P[i];
-        }
         if (do_S) {
             for (int i = 0; i < 10; i++) shared_S[i][lid] = temp_S[i];
         }

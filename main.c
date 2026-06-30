@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 22) /* 2,097,152 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 128
+#define WORKGROUP_SIZE 64
 
 
 /* Internal CPU structs mapping directly to GPU buffers */
@@ -640,13 +640,15 @@ int main(int argc, char** argv) {
         int init_res2 = -1;
         memcpy(mappedResult[next_frame], &init_res2, sizeof(int));
 
-        /* Wait for the CURRENT frame to finish hashing on the GPU */
-        VK_CHECK(vkWaitForFences(device, 1, &fences[cur_frame], VK_TRUE, UINT64_MAX));
-
-        /* Immediately submit the NEXT frame so the GPU doesn't stall while we check the results of the current frame */
+        /* Submit the NEXT frame to the GPU *before* waiting on the current one to eliminate GPU idle stalls */
         vkResetFences(device, 1, &fences[next_frame]);
         VkSubmitInfo subInfo2 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &commandBuffers[next_frame] };
         VK_CHECK(vkQueueSubmit(computeQueue, 1, &subInfo2, fences[next_frame]));
+
+        /* Wait for the CURRENT frame to finish hashing on the GPU */
+        VK_CHECK(vkWaitForFences(device, 1, &fences[cur_frame], VK_TRUE, UINT64_MAX));
+
+
 
         /* Check results of the CURRENT frame */
         int result_index;
