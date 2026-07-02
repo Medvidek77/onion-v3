@@ -1,24 +1,25 @@
-CC ?= gcc
-DEBUG_FLAGS ?=
-CFLAGS = -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=199309L -pthread -I/usr/local/include $(DEBUG_FLAGS)
+CC ?= cc
+CFLAGS = -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=199309L -pthread -I/usr/local/include
 LDFLAGS = -L/usr/local/lib -lvulkan -lsodium -pthread
-GLSLC ?= glslc
 
 TARGET = tor_vanity_vk
 SRCS = main.c fe.c ge.c sc.c
 OBJS = $(SRCS:.c=.o)
-SHADER = shader.spv
 
-all: $(TARGET) $(SHADER)
+all: $(TARGET) shaders
 
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+	@echo "  LD      $@"
+	@$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "  CC      $@"
+	@$(CC) $(CFLAGS) -c $< -o $@
 
-$(SHADER): shader.comp
-	./build_shader.sh
+shaders: shader.comp
+	@echo "  SHLC    shader.comp"
+	@./build_shader.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(SHADER)
+	@echo "  CLEAN"
+	@rm -f $(OBJS) $(TARGET) *.spv
