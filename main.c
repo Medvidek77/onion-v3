@@ -23,7 +23,7 @@
 
 #define BATCH_SIZE (1 << 23) /* 8,388,608 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 256   /* Optimized WG size */
+#define WORKGROUP_SIZE 256
 
 typedef struct {
     int32_t X[10];

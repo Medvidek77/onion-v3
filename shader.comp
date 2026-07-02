@@ -2,13 +2,14 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-#ifdef _PASS_2
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-const uint WG_SIZE = 64u;
-#else
+/* RX 6800 / RDNA2 optimization:
+ * - Uses stable Workgroup layout for optimal occupancy
+ * - Duplicated functions (fe_m/fe_s) bypass the build_shader.sh global DontInline restriction
+ * - fe_m/fe_s are used for hot paths to force inline and maximize ALU performance
+ * - fe_mul/fe_sq are retained exclusively for fe_invert to protect instruction cache
+ */
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 const uint WG_SIZE = 256u;
-#endif
 
 // Array-free struct to reduce VGPR pressure
 struct fe {
