@@ -1,21 +1,22 @@
 #version 450
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-/* RX 6800 / RDNA2 optimization:
- * - Uses stable Workgroup layout for optimal occupancy
- * - Duplicated functions (fe_m/fe_s) bypass the build_shader.sh global DontInline restriction
- * - fe_m/fe_s are used for hot paths to force inline and maximize ALU performance
- * - fe_mul/fe_sq are retained exclusively for fe_invert to protect instruction cache
- */
+#ifdef _PASS_2
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 const uint WG_SIZE = 64u;
+#else
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+const uint WG_SIZE = 256u;
+#endif
 
-shared int shared_P[WG_SIZE][10];
-shared int shared_S[WG_SIZE][10];
-shared int shared_total_inv[10];
+// Array-free struct to reduce VGPR pressure
+struct fe {
+    int v0, v1, v2, v3, v4, v5, v6, v7, v8, v9;
+};
+
+shared int shared_P[10][256];
+shared int shared_S[10][256];
 
 shared int s_base_YplusX[10];
 shared int s_base_YminusX[10];
@@ -29,21 +30,155 @@ layout(std430,set=0,binding=0) readonly buffer restrict BasePoint    { ge_precom
 layout(std430,set=0,binding=1) readonly buffer restrict OffsetPoints { ge_cached offsets[]; };
 layout(std430,set=0,binding=2) buffer ResultBuffer                   { int result_index; };
 
+layout(std430,set=0,binding=3) buffer restrict Buffer_RY              { int buffer_R_Y[]; };
+layout(std430,set=0,binding=4) buffer restrict Buffer_P_excl          { int buffer_P_excl[]; };
+layout(std430,set=0,binding=5) buffer restrict Buffer_S_excl          { int buffer_S_excl[]; };
+layout(std430,set=0,binding=6) buffer restrict Buffer_WG_Totals      { int buffer_workgroup_totals[]; };
+layout(std430,set=0,binding=7) buffer restrict Buffer_WG_Inverses    { int buffer_workgroup_inverses[]; };
+
 layout(push_constant) uniform PushConstants {
     uint batch_size;
     uint valid_bytes;
-    uint8_t byte_target[16];
-    uint8_t byte_mask[16];
+    uint wg_size;
+    uint byte_target[4];
+    uint byte_mask[4];
 } pc;
 
-void fe_add(out int h[10],in int f[10],in int g[10]){for(int i=0;i<10;i++)h[i]=f[i]+g[i];}
-void fe_sub(out int h[10],in int f[10],in int g[10]){for(int i=0;i<10;i++)h[i]=f[i]-g[i];}
+uint get_target_byte(uint idx) {
+    return (pc.byte_target[idx / 4u] >> ((idx % 4u) * 8u)) & 0xFFu;
+}
 
-/* Standard multiplication (patched by build_shader.sh with DontInline) */
-void fe_mul(out int h[10],in int f[10],in int g[10]){
-    int f0=f[0],f1=f[1],f2=f[2],f3=f[3],f4=f[4],f5=f[5],f6=f[6],f7=f[7],f8=f[8],f9=f[9];
-    int g0=g[0],g1=g[1],g2=g[2],g3=g[3],g4=g[4],g5=g[5],g6=g[6],g7=g[7],g8=g[8],g9=g[9];
-    
+uint get_mask_byte(uint idx) {
+    return (pc.byte_mask[idx / 4u] >> ((idx % 4u) * 8u)) & 0xFFu;
+}
+
+fe load_fe_array(int arr[10]) {
+    fe f;
+    f.v0 = arr[0]; f.v1 = arr[1]; f.v2 = arr[2]; f.v3 = arr[3]; f.v4 = arr[4];
+    f.v5 = arr[5]; f.v6 = arr[6]; f.v7 = arr[7]; f.v8 = arr[8]; f.v9 = arr[9];
+    return f;
+}
+
+fe load_shared_P(uint idx) {
+    fe f;
+    f.v0 = shared_P[0][idx]; f.v1 = shared_P[1][idx]; f.v2 = shared_P[2][idx];
+    f.v3 = shared_P[3][idx]; f.v4 = shared_P[4][idx]; f.v5 = shared_P[5][idx];
+    f.v6 = shared_P[6][idx]; f.v7 = shared_P[7][idx]; f.v8 = shared_P[8][idx];
+    f.v9 = shared_P[9][idx];
+    return f;
+}
+
+void store_shared_P(uint idx, fe f) {
+    shared_P[0][idx] = f.v0; shared_P[1][idx] = f.v1; shared_P[2][idx] = f.v2;
+    shared_P[3][idx] = f.v3; shared_P[4][idx] = f.v4; shared_P[5][idx] = f.v5;
+    shared_P[6][idx] = f.v6; shared_P[7][idx] = f.v7; shared_P[8][idx] = f.v8;
+    shared_P[9][idx] = f.v9;
+}
+
+fe load_shared_S(uint idx) {
+    fe f;
+    f.v0 = shared_S[0][idx]; f.v1 = shared_S[1][idx]; f.v2 = shared_S[2][idx];
+    f.v3 = shared_S[3][idx]; f.v4 = shared_S[4][idx]; f.v5 = shared_S[5][idx];
+    f.v6 = shared_S[6][idx]; f.v7 = shared_S[7][idx]; f.v8 = shared_S[8][idx];
+    f.v9 = shared_S[9][idx];
+    return f;
+}
+
+void store_shared_S(uint idx, fe f) {
+    shared_S[0][idx] = f.v0; shared_S[1][idx] = f.v1; shared_S[2][idx] = f.v2;
+    shared_S[3][idx] = f.v3; shared_S[4][idx] = f.v4; shared_S[5][idx] = f.v5;
+    shared_S[6][idx] = f.v6; shared_S[7][idx] = f.v7; shared_S[8][idx] = f.v8;
+    shared_S[9][idx] = f.v9;
+}
+
+fe load_R_Y(uint base_idx) {
+    fe f;
+    f.v0 = buffer_R_Y[base_idx + 0u]; f.v1 = buffer_R_Y[base_idx + 1u]; f.v2 = buffer_R_Y[base_idx + 2u];
+    f.v3 = buffer_R_Y[base_idx + 3u]; f.v4 = buffer_R_Y[base_idx + 4u]; f.v5 = buffer_R_Y[base_idx + 5u];
+    f.v6 = buffer_R_Y[base_idx + 6u]; f.v7 = buffer_R_Y[base_idx + 7u]; f.v8 = buffer_R_Y[base_idx + 8u];
+    f.v9 = buffer_R_Y[base_idx + 9u];
+    return f;
+}
+void store_R_Y(uint base_idx, fe f) {
+    buffer_R_Y[base_idx + 0u] = f.v0; buffer_R_Y[base_idx + 1u] = f.v1; buffer_R_Y[base_idx + 2u] = f.v2;
+    buffer_R_Y[base_idx + 3u] = f.v3; buffer_R_Y[base_idx + 4u] = f.v4; buffer_R_Y[base_idx + 5u] = f.v5;
+    buffer_R_Y[base_idx + 6u] = f.v6; buffer_R_Y[base_idx + 7u] = f.v7; buffer_R_Y[base_idx + 8u] = f.v8;
+    buffer_R_Y[base_idx + 9u] = f.v9;
+}
+
+fe load_P_excl(uint base_idx) {
+    fe f;
+    f.v0 = buffer_P_excl[base_idx + 0u]; f.v1 = buffer_P_excl[base_idx + 1u]; f.v2 = buffer_P_excl[base_idx + 2u];
+    f.v3 = buffer_P_excl[base_idx + 3u]; f.v4 = buffer_P_excl[base_idx + 4u]; f.v5 = buffer_P_excl[base_idx + 5u];
+    f.v6 = buffer_P_excl[base_idx + 6u]; f.v7 = buffer_P_excl[base_idx + 7u]; f.v8 = buffer_P_excl[base_idx + 8u];
+    f.v9 = buffer_P_excl[base_idx + 9u];
+    return f;
+}
+void store_P_excl(uint base_idx, fe f) {
+    buffer_P_excl[base_idx + 0u] = f.v0; buffer_P_excl[base_idx + 1u] = f.v1; buffer_P_excl[base_idx + 2u] = f.v2;
+    buffer_P_excl[base_idx + 3u] = f.v3; buffer_P_excl[base_idx + 4u] = f.v4; buffer_P_excl[base_idx + 5u] = f.v5;
+    buffer_P_excl[base_idx + 6u] = f.v6; buffer_P_excl[base_idx + 7u] = f.v7; buffer_P_excl[base_idx + 8u] = f.v8;
+    buffer_P_excl[base_idx + 9u] = f.v9;
+}
+
+fe load_S_excl(uint base_idx) {
+    fe f;
+    f.v0 = buffer_S_excl[base_idx + 0u]; f.v1 = buffer_S_excl[base_idx + 1u]; f.v2 = buffer_S_excl[base_idx + 2u];
+    f.v3 = buffer_S_excl[base_idx + 3u]; f.v4 = buffer_S_excl[base_idx + 4u]; f.v5 = buffer_S_excl[base_idx + 5u];
+    f.v6 = buffer_S_excl[base_idx + 6u]; f.v7 = buffer_S_excl[base_idx + 7u]; f.v8 = buffer_S_excl[base_idx + 8u];
+    f.v9 = buffer_S_excl[base_idx + 9u];
+    return f;
+}
+void store_S_excl(uint base_idx, fe f) {
+    buffer_S_excl[base_idx + 0u] = f.v0; buffer_S_excl[base_idx + 1u] = f.v1; buffer_S_excl[base_idx + 2u] = f.v2;
+    buffer_S_excl[base_idx + 3u] = f.v3; buffer_S_excl[base_idx + 4u] = f.v4; buffer_S_excl[base_idx + 5u] = f.v5;
+    buffer_S_excl[base_idx + 6u] = f.v6; buffer_S_excl[base_idx + 7u] = f.v7; buffer_S_excl[base_idx + 8u] = f.v8;
+    buffer_S_excl[base_idx + 9u] = f.v9;
+}
+
+fe load_workgroup_totals(uint base_idx) {
+    fe f;
+    f.v0 = buffer_workgroup_totals[base_idx + 0u]; f.v1 = buffer_workgroup_totals[base_idx + 1u]; f.v2 = buffer_workgroup_totals[base_idx + 2u];
+    f.v3 = buffer_workgroup_totals[base_idx + 3u]; f.v4 = buffer_workgroup_totals[base_idx + 4u]; f.v5 = buffer_workgroup_totals[base_idx + 5u];
+    f.v6 = buffer_workgroup_totals[base_idx + 6u]; f.v7 = buffer_workgroup_totals[base_idx + 7u]; f.v8 = buffer_workgroup_totals[base_idx + 8u];
+    f.v9 = buffer_workgroup_totals[base_idx + 9u];
+    return f;
+}
+void store_workgroup_totals(uint base_idx, fe f) {
+    buffer_workgroup_totals[base_idx + 0u] = f.v0; buffer_workgroup_totals[base_idx + 1u] = f.v1; buffer_workgroup_totals[base_idx + 2u] = f.v2;
+    buffer_workgroup_totals[base_idx + 3u] = f.v3; buffer_workgroup_totals[base_idx + 4u] = f.v4; buffer_workgroup_totals[base_idx + 5u] = f.v5;
+    buffer_workgroup_totals[base_idx + 6u] = f.v6; buffer_workgroup_totals[base_idx + 7u] = f.v7; buffer_workgroup_totals[base_idx + 8u] = f.v8;
+    buffer_workgroup_totals[base_idx + 9u] = f.v9;
+}
+
+fe load_workgroup_inverses(uint base_idx) {
+    fe f;
+    f.v0 = buffer_workgroup_inverses[base_idx + 0u]; f.v1 = buffer_workgroup_inverses[base_idx + 1u]; f.v2 = buffer_workgroup_inverses[base_idx + 2u];
+    f.v3 = buffer_workgroup_inverses[base_idx + 3u]; f.v4 = buffer_workgroup_inverses[base_idx + 4u]; f.v5 = buffer_workgroup_inverses[base_idx + 5u];
+    f.v6 = buffer_workgroup_inverses[base_idx + 6u]; f.v7 = buffer_workgroup_inverses[base_idx + 7u]; f.v8 = buffer_workgroup_inverses[base_idx + 8u];
+    f.v9 = buffer_workgroup_inverses[base_idx + 9u];
+    return f;
+}
+void store_workgroup_inverses(uint base_idx, fe f) {
+    buffer_workgroup_inverses[base_idx + 0u] = f.v0; buffer_workgroup_inverses[base_idx + 1u] = f.v1; buffer_workgroup_inverses[base_idx + 2u] = f.v2;
+    buffer_workgroup_inverses[base_idx + 3u] = f.v3; buffer_workgroup_inverses[base_idx + 4u] = f.v4; buffer_workgroup_inverses[base_idx + 5u] = f.v5;
+    buffer_workgroup_inverses[base_idx + 6u] = f.v6; buffer_workgroup_inverses[base_idx + 7u] = f.v7; buffer_workgroup_inverses[base_idx + 8u] = f.v8;
+    buffer_workgroup_inverses[base_idx + 9u] = f.v9;
+}
+
+void fe_add(out fe h, in fe f, in fe g) {
+    h.v0 = f.v0 + g.v0; h.v1 = f.v1 + g.v1; h.v2 = f.v2 + g.v2; h.v3 = f.v3 + g.v3; h.v4 = f.v4 + g.v4;
+    h.v5 = f.v5 + g.v5; h.v6 = f.v6 + g.v6; h.v7 = f.v7 + g.v7; h.v8 = f.v8 + g.v8; h.v9 = f.v9 + g.v9;
+}
+
+void fe_sub(out fe h, in fe f, in fe g) {
+    h.v0 = f.v0 - g.v0; h.v1 = f.v1 - g.v1; h.v2 = f.v2 - g.v2; h.v3 = f.v3 - g.v3; h.v4 = f.v4 - g.v4;
+    h.v5 = f.v5 - g.v5; h.v6 = f.v6 - g.v6; h.v7 = f.v7 - g.v7; h.v8 = f.v8 - g.v8; h.v9 = f.v9 - g.v9;
+}
+
+void fe_mul(out fe h, in fe f, in fe g) {
+    int f0=f.v0,f1=f.v1,f2=f.v2,f3=f.v3,f4=f.v4,f5=f.v5,f6=f.v6,f7=f.v7,f8=f.v8,f9=f.v9;
+    int g0=g.v0,g1=g.v1,g2=g.v2,g3=g.v3,g4=g.v4,g5=g.v5,g6=g.v6,g7=g.v7,g8=g.v8,g9=g.v9;
     int g1_19=g1*19, g2_19=g2*19, g3_19=g3*19, g4_19=g4*19, g5_19=g5*19;
     int g6_19=g6*19, g7_19=g7*19, g8_19=g8*19, g9_19=g9*19;
     int f1_2=f1*2, f3_2=f3*2, f5_2=f5*2, f7_2=f7*2, f9_2=f9*2;
@@ -82,13 +217,12 @@ void fe_mul(out int h[10],in int f[10],in int g[10]){
     c=int((h9+(int64_t(1)<<24))>>25);h0+=int64_t(c*19);h9-=int64_t(c)<<25;
     c=int((h0+(int64_t(1)<<25))>>26);h1+=c;h0-=int64_t(c)<<26;
     
-    h[0]=int(h0);h[1]=int(h1);h[2]=int(h2);h[3]=int(h3);h[4]=int(h4);
-    h[5]=int(h5);h[6]=int(h6);h[7]=int(h7);h[8]=int(h8);h[9]=int(h9);
+    h.v0=int(h0);h.v1=int(h1);h.v2=int(h2);h.v3=int(h3);h.v4=int(h4);
+    h.v5=int(h5);h.v6=int(h6);h.v7=int(h7);h.v8=int(h8);h.v9=int(h9);
 }
 
-void fe_sq(out int h[10],in int f[10]){
-    int f0=f[0], f1=f[1], f2=f[2], f3=f[3], f4=f[4], f5=f[5], f6=f[6], f7=f[7], f8=f[8], f9=f[9];
-    
+void fe_sq(out fe h, in fe f){
+    int f0=f.v0, f1=f.v1, f2=f.v2, f3=f.v3, f4=f.v4, f5=f.v5, f6=f.v6, f7=f.v7, f8=f.v8, f9=f.v9;
     int f0_2=f0*2, f1_2=f1*2, f2_2=f2*2, f3_2=f3*2, f4_2=f4*2, f5_2=f5*2, f6_2=f6*2, f7_2=f7*2, f8_2=f8*2, f9_2=f9*2;
     int f1_4=f1*4, f3_4=f3*4, f5_4=f5*4, f7_4=f7*4;
     int f5_19=f5*19, f6_19=f6*19, f7_19=f7*19, f8_19=f8*19, f9_19=f9*19;
@@ -117,100 +251,48 @@ void fe_sq(out int h[10],in int f[10]){
     c=int((h9+(int64_t(1)<<24))>>25);h0+=int64_t(c*19);h9-=int64_t(c)<<25;
     c=int((h0+(int64_t(1)<<25))>>26);h1+=c;h0-=int64_t(c)<<26;
     
-    h[0]=int(h0);h[1]=int(h1);h[2]=int(h2);h[3]=int(h3);h[4]=int(h4);
-    h[5]=int(h5);h[6]=int(h6);h[7]=int(h7);h[8]=int(h8);h[9]=int(h9);
+    h.v0=int(h0);h.v1=int(h1);h.v2=int(h2);h.v3=int(h3);h.v4=int(h4);
+    h.v5=int(h5);h.v6=int(h6);h.v7=int(h7);h.v8=int(h8);h.v9=int(h9);
 }
 
-/* Inlined multiplication (bypasses build_shader.sh) */
-void fe_m(out int h[10],in int f[10],in int g[10]){
-    int f0=f[0],f1=f[1],f2=f[2],f3=f[3],f4=f[4],f5=f[5],f6=f[6],f7=f[7],f8=f[8],f9=f[9];
-    int g0=g[0],g1=g[1],g2=g[2],g3=g[3],g4=g[4],g5=g[5],g6=g[6],g7=g[7],g8=g[8],g9=g[9];
-    int g1_19=g1*19, g2_19=g2*19, g3_19=g3*19, g4_19=g4*19, g5_19=g5*19;
-    int g6_19=g6*19, g7_19=g7*19, g8_19=g8*19, g9_19=g9*19;
-    int f1_2=f1*2, f3_2=f3*2, f5_2=f5*2, f7_2=f7*2, f9_2=f9*2;
+void ge_madd_precomp_YZ(out fe r_Y,out fe r_Z,
+                        in fe q_YplusX,in fe q_YminusX,in fe q_Z,in fe q_T2d){
+    fe t1, t2;
+    fe s_base_YplusX_s = load_fe_array(s_base_YplusX);
+    fe s_base_YminusX_s = load_fe_array(s_base_YminusX);
+    fe s_base_Z2_s = load_fe_array(s_base_Z2);
+    fe s_base_T_s = load_fe_array(s_base_T);
 
-    int64_t h0 = int64_t(f0)*g0 + int64_t(f1_2)*g9_19 + int64_t(f2)*g8_19 + int64_t(f3_2)*g7_19 + int64_t(f4)*g6_19 
-               + int64_t(f5_2)*g5_19 + int64_t(f6)*g4_19 + int64_t(f7_2)*g3_19 + int64_t(f8)*g2_19 + int64_t(f9_2)*g1_19;
-    int64_t h1 = int64_t(f0)*g1 + int64_t(f1)*g0 + int64_t(f2)*g9_19 + int64_t(f3)*g8_19 + int64_t(f4)*g7_19 
-               + int64_t(f5)*g6_19 + int64_t(f6)*g5_19 + int64_t(f7)*g4_19 + int64_t(f8)*g3_19 + int64_t(f9)*g2_19;
-    int64_t h2 = int64_t(f0)*g2 + int64_t(f1_2)*g1 + int64_t(f2)*g0 + int64_t(f3_2)*g9_19 + int64_t(f4)*g8_19 
-               + int64_t(f5_2)*g7_19 + int64_t(f6)*g6_19 + int64_t(f7_2)*g5_19 + int64_t(f8)*g4_19 + int64_t(f9_2)*g3_19;
-    int64_t h3 = int64_t(f0)*g3 + int64_t(f1)*g2 + int64_t(f2)*g1 + int64_t(f3)*g0 + int64_t(f4)*g9_19 
-               + int64_t(f5)*g8_19 + int64_t(f6)*g7_19 + int64_t(f7)*g6_19 + int64_t(f8)*g5_19 + int64_t(f9)*g4_19;
-    int64_t h4 = int64_t(f0)*g4 + int64_t(f1_2)*g3 + int64_t(f2)*g2 + int64_t(f3_2)*g1 + int64_t(f4)*g0 
-               + int64_t(f5_2)*g9_19 + int64_t(f6)*g8_19 + int64_t(f7_2)*g7_19 + int64_t(f8)*g6_19 + int64_t(f9_2)*g5_19;
-    int64_t h5 = int64_t(f0)*g5 + int64_t(f1)*g4 + int64_t(f2)*g3 + int64_t(f3)*g2 + int64_t(f4)*g1 
-               + int64_t(f5)*g0 + int64_t(f6)*g9_19 + int64_t(f7)*g8_19 + int64_t(f8)*g7_19 + int64_t(f9)*g6_19;
-    int64_t h6 = int64_t(f0)*g6 + int64_t(f1_2)*g5 + int64_t(f2)*g4 + int64_t(f3_2)*g3 + int64_t(f4)*g2 
-               + int64_t(f5_2)*g1 + int64_t(f6)*g0 + int64_t(f7_2)*g9_19 + int64_t(f8)*g8_19 + int64_t(f9_2)*g7_19;
-    int64_t h7 = int64_t(f0)*g7 + int64_t(f1)*g6 + int64_t(f2)*g5 + int64_t(f3)*g4 + int64_t(f4)*g3 
-               + int64_t(f5)*g2 + int64_t(f6)*g1 + int64_t(f7)*g0 + int64_t(f8)*g9_19 + int64_t(f9)*g8_19;
-    int64_t h8 = int64_t(f0)*g8 + int64_t(f1_2)*g7 + int64_t(f2)*g6 + int64_t(f3_2)*g5 + int64_t(f4)*g4 
-               + int64_t(f5_2)*g3 + int64_t(f6)*g2 + int64_t(f7_2)*g1 + int64_t(f8)*g0 + int64_t(f9_2)*g9_19;
-    int64_t h9 = int64_t(f0)*g9 + int64_t(f1)*g8 + int64_t(f2)*g7 + int64_t(f3)*g6 + int64_t(f4)*g5 
-               + int64_t(f5)*g4 + int64_t(f6)*g3 + int64_t(f7)*g2 + int64_t(f8)*g1 + int64_t(f9)*g0;
-
-    int c;
-    c=int((h0+(int64_t(1)<<25))>>26);h1+=c;h0-=int64_t(c)<<26;
-    c=int((h1+(int64_t(1)<<24))>>25);h2+=c;h1-=int64_t(c)<<25;
-    c=int((h2+(int64_t(1)<<25))>>26);h3+=c;h2-=int64_t(c)<<26;
-    c=int((h3+(int64_t(1)<<24))>>25);h4+=c;h3-=int64_t(c)<<25;
-    c=int((h4+(int64_t(1)<<25))>>26);h5+=c;h4-=int64_t(c)<<26;
-    c=int((h5+(int64_t(1)<<24))>>25);h6+=c;h5-=int64_t(c)<<25;
-    c=int((h6+(int64_t(1)<<25))>>26);h7+=c;h6-=int64_t(c)<<26;
-    c=int((h7+(int64_t(1)<<24))>>25);h8+=c;h7-=int64_t(c)<<25;
-    c=int((h8+(int64_t(1)<<25))>>26);h9+=c;h8-=int64_t(c)<<26;
-    c=int((h9+(int64_t(1)<<24))>>25);h0+=int64_t(c*19);h9-=int64_t(c)<<25;
-    c=int((h0+(int64_t(1)<<25))>>26);h1+=c;h0-=int64_t(c)<<26;
-    
-    h[0]=int(h0);h[1]=int(h1);h[2]=int(h2);h[3]=int(h3);h[4]=int(h4);
-    h[5]=int(h5);h[6]=int(h6);h[7]=int(h7);h[8]=int(h8);h[9]=int(h9);
-}
-
-void ge_madd_precomp_YZ(out int r_Y[10],out int r_Z[10],
-                        in int q_YplusX[10],in int q_YminusX[10],in int q_Z[10],in int q_T2d[10]){
-    int t1[10], t2[10];
-    
-    /* using inline variant */
-    fe_m(t1, s_base_YplusX, q_YplusX);   
-    fe_m(t2, s_base_YminusX, q_YminusX); 
+    fe_mul(t1, s_base_YplusX_s, q_YplusX);   
+    fe_mul(t2, s_base_YminusX_s, q_YminusX); 
     fe_add(r_Y, t1, t2);              
-    
-    fe_m(t1, q_T2d, s_base_T);           
-    fe_m(t2, s_base_Z2, q_Z);            
-    
+    fe_mul(t1, q_T2d, s_base_T_s);           
+    fe_mul(t2, s_base_Z2_s, q_Z);            
     fe_sub(r_Z, t2, t1);              
     fe_add(t2, t2, t1);               
-    
-    fe_m(t1, r_Y, t2);              
-    for(int i=0; i<10; i++) r_Y[i] = t1[i];
-    
-    fe_m(t1, t2, r_Z);              
-    for(int i=0; i<10; i++) r_Z[i] = t1[i];
+    fe_mul(t1, r_Y, t2);              
+    r_Y = t1;
+    fe_mul(t1, t2, r_Z);              
+    r_Z = t1;
 }
 
-void fe_invert(out int out_fe[10],in int z[10]){
-    /* calls fe_sq and fe_mul which are patched with DontInline to protect instruction cache */
-    int t0[10],t1[10],t2[10];
+void fe_invert(out fe out_fe,in fe z){
+    fe t0,t1,t2;
     fe_sq(t0,z); fe_sq(t1,t0); fe_sq(t1,t1); fe_mul(t1,z,t1); fe_mul(t0,t0,t1);
     fe_sq(t2,t0); fe_mul(t1,t1,t2);
     fe_sq(t2,t1);fe_sq(t2,t2);fe_sq(t2,t2);fe_sq(t2,t2);fe_sq(t2,t2);
     fe_mul(t1,t2,t1);
     fe_sq(t2,t1); for(int i=1;i<10;++i) fe_sq(t2,t2); fe_mul(t2,t2,t1);
-    
     fe_sq(out_fe,t2); for(int i=1;i<20;++i) fe_sq(out_fe,out_fe); fe_mul(t2,out_fe,t2);
     fe_sq(out_fe,t2); for(int i=1;i<10;++i) fe_sq(out_fe,out_fe); fe_mul(t1,out_fe,t1);
-    
     fe_sq(t2,t1); for(int i=1;i<50;++i) fe_sq(t2,t2); fe_mul(t2,t2,t1);
-    
     fe_sq(out_fe,t2); for(int i=1;i<100;++i)fe_sq(out_fe,out_fe); fe_mul(t2,out_fe,t2);
     fe_sq(out_fe,t2); for(int i=1;i<50;++i) fe_sq(out_fe,out_fe); fe_mul(t1,out_fe,t1);
-    
     fe_sq(t1,t1); for(int i=1;i<5;++i)  fe_sq(t1,t1); fe_mul(out_fe,t1,t0);
 }
 
-bool check_prefix(in int h[10]) {
-    int h0=h[0],h1=h[1],h2=h[2],h3=h[3],h4=h[4],h5=h[5],h6=h[6],h7=h[7],h8=h[8],h9=h[9];
+bool check_prefix(in fe h) {
+    int h0=h.v0,h1=h.v1,h2=h.v2,h3=h.v3,h4=h.v4,h5=h.v5,h6=h.v6,h7=h.v7,h8=h.v8,h9=h.v9;
     int c;
     
     c=(h0+(1<<25))>>26; h1+=c; h0-=c<<26;
@@ -228,44 +310,65 @@ bool check_prefix(in int h[10]) {
     q=(h4+q)>>26; q=(h5+q)>>25; q=(h6+q)>>26; q=(h7+q)>>25;
     q=(h8+q)>>26; q=(h9+q)>>25; h0+=19*q;
     
-    uint8_t b;
-
+    uint b;
     c=h0>>26; h1+=c; h0-=c<<26; 
     
-    bool match = true;
-
-    b = uint8_t(h0);       match = match && (pc.valid_bytes <= 0 || (b & pc.byte_mask[0]) == pc.byte_target[0]);
-    b = uint8_t(h0 >> 8);  match = match && (pc.valid_bytes <= 1 || (b & pc.byte_mask[1]) == pc.byte_target[1]);
-    b = uint8_t(h0 >> 16); match = match && (pc.valid_bytes <= 2 || (b & pc.byte_mask[2]) == pc.byte_target[2]);
+    if (pc.valid_bytes > 0) {
+        b = uint(h0) & 0xFFu; if ((b & get_mask_byte(0)) != get_target_byte(0)) return false;
+    }
+    if (pc.valid_bytes > 1) {
+        b = (uint(h0) >> 8) & 0xFFu; if ((b & get_mask_byte(1)) != get_target_byte(1)) return false;
+    }
+    if (pc.valid_bytes > 2) {
+        b = (uint(h0) >> 16) & 0xFFu; if ((b & get_mask_byte(2)) != get_target_byte(2)) return false;
+    }
+    if (pc.valid_bytes <= 3) return true;
 
     c=h1>>25; h2+=c; h1-=c<<25;
-
-    b = uint8_t((h0 >> 24) | (h1 << 2)); match = match && (pc.valid_bytes <= 3 || (b & pc.byte_mask[3]) == pc.byte_target[3]);
-    b = uint8_t(h1 >> 6);                match = match && (pc.valid_bytes <= 4 || (b & pc.byte_mask[4]) == pc.byte_target[4]);
-    b = uint8_t(h1 >> 14);               match = match && (pc.valid_bytes <= 5 || (b & pc.byte_mask[5]) == pc.byte_target[5]);
+    b = ((uint(h0) >> 24) | (uint(h1) << 2)) & 0xFFu; if ((b & get_mask_byte(3)) != get_target_byte(3)) return false;
+    if (pc.valid_bytes > 4) {
+        b = (uint(h1) >> 6) & 0xFFu; if ((b & get_mask_byte(4)) != get_target_byte(4)) return false;
+    }
+    if (pc.valid_bytes > 5) {
+        b = (uint(h1) >> 14) & 0xFFu; if ((b & get_mask_byte(5)) != get_target_byte(5)) return false;
+    }
+    if (pc.valid_bytes <= 6) return true;
 
     c=h2>>26; h3+=c; h2-=c<<26; 
-
-    b = uint8_t((h1 >> 22) | (h2 << 3)); match = match && (pc.valid_bytes <= 6 || (b & pc.byte_mask[6]) == pc.byte_target[6]);
-    b = uint8_t(h2 >> 5);                match = match && (pc.valid_bytes <= 7 || (b & pc.byte_mask[7]) == pc.byte_target[7]);
-    b = uint8_t(h2 >> 13);               match = match && (pc.valid_bytes <= 8 || (b & pc.byte_mask[8]) == pc.byte_target[8]);
+    b = ((uint(h1) >> 22) | (uint(h2) << 3)) & 0xFFu; if ((b & get_mask_byte(6)) != get_target_byte(6)) return false;
+    if (pc.valid_bytes > 7) {
+        b = (uint(h2) >> 5) & 0xFFu; if ((b & get_mask_byte(7)) != get_target_byte(7)) return false;
+    }
+    if (pc.valid_bytes > 8) {
+        b = (uint(h2) >> 13) & 0xFFu; if ((b & get_mask_byte(8)) != get_target_byte(8)) return false;
+    }
+    if (pc.valid_bytes <= 9) return true;
 
     c=h3>>25; h4+=c; h3-=c<<25;
-
-    b = uint8_t((h2 >> 21) | (h3 << 5)); match = match && (pc.valid_bytes <= 9  || (b & pc.byte_mask[9]) == pc.byte_target[9]);
-    b = uint8_t(h3 >> 3);                match = match && (pc.valid_bytes <= 10 || (b & pc.byte_mask[10]) == pc.byte_target[10]);
-    b = uint8_t(h3 >> 11);               match = match && (pc.valid_bytes <= 11 || (b & pc.byte_mask[11]) == pc.byte_target[11]);
+    b = ((uint(h2) >> 21) | (uint(h3) << 5)) & 0xFFu; if ((b & get_mask_byte(9)) != get_target_byte(9)) return false;
+    if (pc.valid_bytes > 10) {
+        b = (uint(h3) >> 3) & 0xFFu; if ((b & get_mask_byte(10)) != get_target_byte(10)) return false;
+    }
+    if (pc.valid_bytes > 11) {
+        b = (uint(h3) >> 11) & 0xFFu; if ((b & get_mask_byte(11)) != get_target_byte(11)) return false;
+    }
+    if (pc.valid_bytes <= 12) return true;
 
     c=h4>>26; h5+=c; h4-=c<<26;
-
-    b = uint8_t((h3 >> 19) | (h4 << 6)); match = match && (pc.valid_bytes <= 12 || (b & pc.byte_mask[12]) == pc.byte_target[12]);
-    b = uint8_t(h4 >> 2);                match = match && (pc.valid_bytes <= 13 || (b & pc.byte_mask[13]) == pc.byte_target[13]);
-    b = uint8_t(h4 >> 10);               match = match && (pc.valid_bytes <= 14 || (b & pc.byte_mask[14]) == pc.byte_target[14]);
-    b = uint8_t(h4 >> 18);               match = match && (pc.valid_bytes <= 15 || (b & pc.byte_mask[15]) == pc.byte_target[15]);
-
-    return match;
+    b = ((uint(h3) >> 19) | (uint(h4) << 6)) & 0xFFu; if ((b & get_mask_byte(12)) != get_target_byte(12)) return false;
+    if (pc.valid_bytes > 13) {
+        b = (uint(h4) >> 2) & 0xFFu; if ((b & get_mask_byte(13)) != get_target_byte(13)) return false;
+    }
+    if (pc.valid_bytes > 14) {
+        b = (uint(h4) >> 10) & 0xFFu; if ((b & get_mask_byte(14)) != get_target_byte(14)) return false;
+    }
+    if (pc.valid_bytes > 15) {
+        b = (uint(h4) >> 18) & 0xFFu; if ((b & get_mask_byte(15)) != get_target_byte(15)) return false;
+    }
+    return true;
 }
 
+#ifdef _PASS_1
 void main() {
     uint id = gl_GlobalInvocationID.x;
     uint lid = gl_LocalInvocationID.x;
@@ -280,95 +383,118 @@ void main() {
     }
     barrier();
 
-    int R_Y[10], R_Z[10];
+    fe R_Y, R_Z;
 
     if (id < pc.batch_size) {
-        ge_madd_precomp_YZ(R_Y, R_Z,
-                           offsets[id].YplusX, offsets[id].YminusX, offsets[id].Z, offsets[id].T2d);
+        fe offset_YplusX = load_fe_array(offsets[id].YplusX);
+        fe offset_YminusX = load_fe_array(offsets[id].YminusX);
+        fe offset_Z = load_fe_array(offsets[id].Z);
+        fe offset_T2d = load_fe_array(offsets[id].T2d);
 
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = R_Z[i];
-            shared_S[lid][i] = R_Z[i];
-        }
+        ge_madd_precomp_YZ(R_Y, R_Z,
+                           offset_YplusX, offset_YminusX, offset_Z, offset_T2d);
+
+        store_shared_P(lid, R_Z);
+        store_shared_S(lid, R_Z);
     } else {
-        int one[10] = int[](1,0,0,0,0,0,0,0,0,0);
-        for (int i = 0; i < 10; i++) {
-            shared_P[lid][i] = one[i];
-            shared_S[lid][i] = one[i];
-        }
+        fe one;
+        one.v0=1; one.v1=0; one.v2=0; one.v3=0; one.v4=0;
+        one.v5=0; one.v6=0; one.v7=0; one.v8=0; one.v9=0;
+        store_shared_P(lid, one);
+        store_shared_S(lid, one);
     }
     barrier();
 
-    for (uint stride = 1; stride < WG_SIZE; stride *= 2) {
-        int temp_P[10], temp_S[10];
+    // Hillis-Steele LDS prefix scan
+    for (uint stride = 1u; stride < WG_SIZE; stride *= 2u) {
+        fe temp_P, temp_S;
         bool do_P = (lid >= stride);
         bool do_S = (lid + stride < WG_SIZE);
 
         if (do_P) {
-            int P_curr[10], P_prev[10];
-            for (int i = 0; i < 10; i++) {
-                P_curr[i] = shared_P[lid][i];
-                P_prev[i] = shared_P[lid - stride][i];
-            }
-            fe_m(temp_P, P_curr, P_prev); /* inlined */
+            fe P_curr = load_shared_P(lid);
+            fe P_prev = load_shared_P(lid - stride);
+            fe_mul(temp_P, P_curr, P_prev);
         }
         
         if (do_S) {
-            int S_curr[10], S_next[10];
-            for (int i = 0; i < 10; i++) {
-                S_curr[i] = shared_S[lid][i];
-                S_next[i] = shared_S[lid + stride][i];
-            }
-            fe_m(temp_S, S_curr, S_next); /* inlined */
+            fe S_curr = load_shared_S(lid);
+            fe S_next = load_shared_S(lid + stride);
+            fe_mul(temp_S, S_curr, S_next);
         }
         
         barrier();
 
-        if (do_P) {
-            for (int i = 0; i < 10; i++) shared_P[lid][i] = temp_P[i];
-        }
-        if (do_S) {
-            for (int i = 0; i < 10; i++) shared_S[lid][i] = temp_S[i];
-        }
+        if (do_P) store_shared_P(lid, temp_P);
+        if (do_S) store_shared_S(lid, temp_S);
         
         barrier();
+    }
+
+    if (id < pc.batch_size) {
+        fe P_excl;
+        if (lid == 0u) {
+            P_excl.v0=1; P_excl.v1=0; P_excl.v2=0; P_excl.v3=0; P_excl.v4=0;
+            P_excl.v5=0; P_excl.v6=0; P_excl.v7=0; P_excl.v8=0; P_excl.v9=0;
+        } else {
+            P_excl = load_shared_P(lid - 1u);
+        }
+
+        fe S_excl;
+        if (lid == WG_SIZE - 1u) {
+            S_excl.v0=1; S_excl.v1=0; S_excl.v2=0; S_excl.v3=0; S_excl.v4=0;
+            S_excl.v5=0; S_excl.v6=0; S_excl.v7=0; S_excl.v8=0; S_excl.v9=0;
+        } else {
+            S_excl = load_shared_S(lid + 1u);
+        }
+
+        // Store intermediate results to VRAM
+        store_R_Y(id * 10u, R_Y);
+        store_P_excl(id * 10u, P_excl);
+        store_S_excl(id * 10u, S_excl);
     }
 
     if (lid == WG_SIZE - 1u) {
-        int last_P[10];
-        for (int i = 0; i < 10; i++) last_P[i] = shared_P[WG_SIZE - 1u][i];
-        fe_invert(shared_total_inv, last_P);
-    }
-    barrier();
-
-    if (id < pc.batch_size) {
-        int P_excl[10];
-        if (lid == 0) {
-            for (int i = 0; i < 10; i++) P_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) P_excl[i] = shared_P[lid - 1][i];
-        }
-
-        int S_excl[10];
-        if (lid == WG_SIZE - 1u) {
-            for (int i = 0; i < 10; i++) S_excl[i] = (i == 0) ? 1 : 0;
-        } else {
-            for (int i = 0; i < 10; i++) S_excl[i] = shared_S[lid + 1][i];
-        }
-
-        int recip[10];
-        fe_m(recip, P_excl, S_excl);
-
-        int total_inv_local[10];
-        for (int i = 0; i < 10; i++) total_inv_local[i] = shared_total_inv[i];
-
-        fe_m(recip, recip, total_inv_local);
-
-        int final_Y[10];
-        fe_m(final_Y, R_Y, recip);
-
-        if (check_prefix(final_Y)) {
-            atomicCompSwap(result_index, -1, int(id));
-        }
+        uint group_id = gl_WorkGroupID.x;
+        fe last_P = load_shared_P(WG_SIZE - 1u);
+        store_workgroup_totals(group_id * 10u, last_P);
     }
 }
+#endif
+
+#ifdef _PASS_2
+void main() {
+    uint group_id = gl_GlobalInvocationID.x;
+    if (group_id >= (pc.batch_size / 256u)) return;
+
+    fe total_prod = load_workgroup_totals(group_id * 10u);
+    fe total_inv;
+    fe_invert(total_inv, total_prod);
+    store_workgroup_inverses(group_id * 10u, total_inv);
+}
+#endif
+
+#ifdef _PASS_3
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.batch_size) return;
+
+    uint group_id = id / 256u;
+
+    fe R_Y = load_R_Y(id * 10u);
+    fe P_excl = load_P_excl(id * 10u);
+    fe S_excl = load_S_excl(id * 10u);
+    fe total_inv = load_workgroup_inverses(group_id * 10u);
+
+    fe recip;
+    fe_mul(recip, P_excl, S_excl);
+    fe_mul(recip, recip, total_inv);
+
+    fe final_Y;
+    fe_mul(final_Y, R_Y, recip);
+
+    if (check_prefix(final_Y)) {
+        atomicCompSwap(result_index, -1, int(id));
+    }
+}
+#endif

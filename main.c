@@ -21,12 +21,10 @@
 #include "ge.h"
 #include "sc.h"
 
-#define BATCH_SIZE (1 << 22) /* 2,097,152 */
+#define BATCH_SIZE (1 << 23) /* 8,388,608 */
 #define NUM_THREADS 12       /* Max CPU threads for Ryzen 5 5600 */
-#define WORKGROUP_SIZE 64
+#define WORKGROUP_SIZE 256   /* Optimized WG size */
 
-
-/* Internal CPU structs mapping directly to GPU buffers */
 typedef struct {
     int32_t X[10];
     int32_t Y[10];
@@ -47,6 +45,14 @@ typedef struct {
     int32_t Z[10];
     int32_t T2d[10];
 } gpu_ge_cached;
+
+typedef struct {
+    uint32_t batch_size;
+    uint32_t valid_bytes;
+    uint32_t wg_size;
+    uint8_t  byte_target[16];
+    uint8_t  byte_mask[16];
+} PushConstants;
 
 #ifdef DEBUG
     #define DEBUG_PRINT(...) printf("[DEBUG] " __VA_ARGS__)
@@ -99,16 +105,11 @@ void convert_cached_to_gpu(gpu_ge_cached* dst, const ge_cached* src) {
 }
 
 void generate_offsets(gpu_ge_cached* offsets, uint32_t count) {
-    printf("Precomputing %u point additions for GPU... ", count);
-    fflush(stdout);
 
-    /* We want offsets O[i] = i * 8 * G */
-    /* G is the base point */
     ge_p3 G, cur_p3;
     const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-    ge_scalarmult_base(&G, one); /* G */
+    ge_scalarmult_base(&G, one);
 
-    /* Calculate 8*G */
     ge_p1p1 p1;
     ge_p2 p2;
     ge_p3_to_p2(&p2, &G);
@@ -123,7 +124,7 @@ void generate_offsets(gpu_ge_cached* offsets, uint32_t count) {
     ge_p3_to_cached(&step_cached, &step_p3);
 
     ge_p3 sum;
-    ge_p3_0(&sum); /* Start at 0*G */
+    ge_p3_0(&sum);
 
     for (uint32_t i = 0; i < count; i++) {
         ge_cached c;
@@ -133,13 +134,41 @@ void generate_offsets(gpu_ge_cached* offsets, uint32_t count) {
         ge_add(&p1, &sum, &step_cached);
         ge_p1p1_to_p3(&sum, &p1);
     }
-    printf("Done.\n");
-}
+    }
 
 double get_time_sec() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1000000000.0;
+}
+
+VkShaderModule loadShaderModule(VkDevice device, const char* filename) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s\n", filename);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_END);
+    size_t shaderSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint32_t* shaderCode = malloc(shaderSize);
+    size_t read_bytes = fread(shaderCode, 1, shaderSize, f);
+    fclose(f);
+    if (read_bytes != shaderSize) {
+        fprintf(stderr, "Failed to read full %s\n", filename);
+        free(shaderCode);
+        exit(1);
+    }
+
+    VkShaderModuleCreateInfo shaderInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = shaderSize,
+        .pCode = shaderCode
+    };
+    VkShaderModule computeShaderModule;
+    VK_CHECK(vkCreateShaderModule(device, &shaderInfo, NULL, &computeShaderModule));
+    free(shaderCode);
+    return computeShaderModule;
 }
 
 int main(int argc, char** argv) {
@@ -195,55 +224,37 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to create Vulkan instance.\n");
         return 1;
     }
-    DEBUG_PRINT("Vulkan instance created successfully.\n");
 
     uint32_t deviceCount = 0;
     vkEnumeratePhysicalDevices(instance, &deviceCount, NULL);
-    if (deviceCount == 0) {
-        fprintf(stderr, "Failed to find GPUs with Vulkan support.\n");
-        return 1;
-    }
-    DEBUG_PRINT("Found %d physical device(s).\n", deviceCount);
-
     VkPhysicalDevice* physicalDevices = malloc(sizeof(VkPhysicalDevice) * deviceCount);
     vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices);
-
-    /* Attempt to prefer Discrete GPUs, fallback to first available */
     VkPhysicalDevice physicalDevice = physicalDevices[0];
     for (uint32_t i = 0; i < deviceCount; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physicalDevices[i], &props);
-        DEBUG_PRINT("Device %d: %s (Type: %d)\n", i, props.deviceName, props.deviceType);
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
             physicalDevice = physicalDevices[i];
             break;
         }
     }
-
     VkPhysicalDeviceProperties deviceProperties;
     vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
-    printf("Using Vulkan Device: %s\n", deviceProperties.deviceName);
+    printf("Device: %s\n", deviceProperties.deviceName);
     free(physicalDevices);
 
     uint32_t queueFamilyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, NULL);
     VkQueueFamilyProperties* queueFamilies = malloc(sizeof(VkQueueFamilyProperties) * queueFamilyCount);
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies);
-
     uint32_t computeFamily = -1;
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
-        DEBUG_PRINT("Queue Family %d: flags 0x%08X, count %d\n", i, queueFamilies[i].queueFlags, queueFamilies[i].queueCount);
         if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             computeFamily = i;
             break;
         }
     }
     free(queueFamilies);
-    if (computeFamily == (uint32_t)-1) {
-        fprintf(stderr, "Failed to find compute queue family.\n");
-        return 1;
-    }
-    DEBUG_PRINT("Selected Compute Queue Family Index: %d\n", computeFamily);
 
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCreateInfo = {
@@ -253,22 +264,13 @@ int main(int argc, char** argv) {
         .pQueuePriorities = &queuePriority
     };
 
-    const char* deviceExtensions[] = {
-        VK_KHR_8BIT_STORAGE_EXTENSION_NAME
-    };
-
-    VkPhysicalDevice8BitStorageFeatures features8 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
-        .storageBuffer8BitAccess = VK_TRUE
-    };
-
     VkDeviceCreateInfo deviceCreateInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &features8,
+        .pNext = NULL,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queueCreateInfo,
-        .enabledExtensionCount = 1,
-        .ppEnabledExtensionNames = deviceExtensions
+        .enabledExtensionCount = 0,
+        .ppEnabledExtensionNames = NULL
     };
 
     VkDevice device;
@@ -282,7 +284,14 @@ int main(int argc, char** argv) {
     size_t offsets_size = BATCH_SIZE * sizeof(gpu_ge_cached);
     size_t result_size = sizeof(int);
 
-    /* Allocate host buffers */
+    // Calculate size of intermediate VRAM buffer
+    size_t ry_size = BATCH_SIZE * 10 * sizeof(int32_t);
+    size_t p_excl_size = BATCH_SIZE * 10 * sizeof(int32_t);
+    size_t s_excl_size = BATCH_SIZE * 10 * sizeof(int32_t);
+    size_t totals_size = (BATCH_SIZE / WORKGROUP_SIZE) * 10 * sizeof(int32_t);
+    size_t inv_size = (BATCH_SIZE / WORKGROUP_SIZE) * 10 * sizeof(int32_t);
+    size_t intermediate_total_size = ry_size + p_excl_size + s_excl_size + totals_size + inv_size;
+
     gpu_ge_precomp_base host_basepoint[2];
     gpu_ge_cached* host_offsets = malloc(offsets_size);
     generate_offsets(host_offsets, BATCH_SIZE);
@@ -338,8 +347,6 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &offsetsBuffer));
     vkGetBufferMemoryRequirements(device, offsetsBuffer, &memReqs);
     allocInfo.allocationSize = memReqs.size;
-
-    /* Try DEVICE_LOCAL. If it fails (e.g. llvmpipe without dedicated memory), fall back to HOST_VISIBLE. */
     uint32_t memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (memTypeIndex == (uint32_t)-1) {
         memTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -347,6 +354,21 @@ int main(int argc, char** argv) {
     allocInfo.memoryTypeIndex = memTypeIndex;
     VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &offsetsMemory));
     vkBindBufferMemory(device, offsetsBuffer, offsetsMemory, 0);
+
+    // Allocate VRAM intermediate buffer
+    VkBuffer intermediateBuffer;
+    VkDeviceMemory intermediateMemory;
+    bufferInfo.size = intermediate_total_size;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VK_CHECK(vkCreateBuffer(device, &bufferInfo, NULL, &intermediateBuffer));
+    vkGetBufferMemoryRequirements(device, intermediateBuffer, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (allocInfo.memoryTypeIndex == (uint32_t)-1) {
+        allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, NULL, &intermediateMemory));
+    vkBindBufferMemory(device, intermediateBuffer, intermediateMemory, 0);
 
     VkCommandBufferAllocateInfo allocTransferInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -372,7 +394,7 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(device, stagingBuffer, NULL);
     vkFreeMemory(device, stagingMemory, NULL);
 
-    /* Prefix Bitmask (No GPU buffer needed, using push constants) */
+    /* Prefix Bitmask */
     uint8_t byte_target[16] = {0};
     uint8_t byte_mask[16] = {0};
     uint32_t total_bits = prefix_len * 5;
@@ -424,57 +446,34 @@ int main(int argc, char** argv) {
         vkBindBufferMemory(device, resultBuffer[i], resultMemory[i], 0);
     }
 
-    /* Load shader */
-    FILE* f = fopen("shader.spv", "rb");
-    if (!f) {
-        fprintf(stderr, "Failed to open shader.spv. Did you compile it?\n");
-        return 1;
-    }
-    fseek(f, 0, SEEK_END);
-    size_t shaderSize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint32_t* shaderCode = malloc(shaderSize);
-    size_t read_bytes = fread(shaderCode, 1, shaderSize, f);
-    fclose(f);
-    if (read_bytes != shaderSize) {
-        fprintf(stderr, "Failed to read full shader.spv\n");
-        free(shaderCode);
-        return 1;
-    }
+    /* Load Shaders */
+    VkShaderModule shaderModule1 = loadShaderModule(device, "scan.spv");
+    VkShaderModule shaderModule2 = loadShaderModule(device, "invert.spv");
+    VkShaderModule shaderModule3 = loadShaderModule(device, "finalize.spv");
 
-    VkShaderModuleCreateInfo shaderInfo = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = shaderSize,
-        .pCode = shaderCode
-    };
-    VkShaderModule computeShaderModule;
-    VK_CHECK(vkCreateShaderModule(device, &shaderInfo, NULL, &computeShaderModule));
-    free(shaderCode);
-
-    /* Descriptor set layout */
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    /* Descriptor set layout - 8 bindings for all passes */
+    VkDescriptorSetLayoutBinding bindings[8] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
+        .bindingCount = 8,
         .pBindings = bindings
     };
     VkDescriptorSetLayout descriptorSetLayout;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &descriptorSetLayout));
 
-    typedef struct {
-        uint32_t batch_size;
-        uint32_t valid_bytes;
-        uint8_t  byte_target[16];
-        uint8_t  byte_mask[16];
-    } PushConstants;
-
     PushConstants pc_data = {0};
     pc_data.batch_size = BATCH_SIZE;
     pc_data.valid_bytes = valid_bytes;
+    pc_data.wg_size = WORKGROUP_SIZE;
     memcpy(pc_data.byte_target, byte_target, 16);
     memcpy(pc_data.byte_mask, byte_mask, 16);
 
@@ -495,22 +494,48 @@ int main(int argc, char** argv) {
     VkPipelineLayout pipelineLayout;
     VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutInfo, NULL, &pipelineLayout));
 
-    /* Compute Pipeline */
-    VkComputePipelineCreateInfo pipelineInfo = {
+    /* Create 3 Pipelines */
+    VkComputePipelineCreateInfo pipelineInfo1 = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = computeShaderModule,
+            .module = shaderModule1,
             .pName = "main"
         },
         .layout = pipelineLayout
     };
-    VkPipeline computePipeline;
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &computePipeline));
+    VkPipeline computePipeline1;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo1, NULL, &computePipeline1));
 
-    /* Descriptor Pool (Double Buffered) */
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
+    VkComputePipelineCreateInfo pipelineInfo2 = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shaderModule2,
+            .pName = "main"
+        },
+        .layout = pipelineLayout
+    };
+    VkPipeline computePipeline2;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo2, NULL, &computePipeline2));
+
+    VkComputePipelineCreateInfo pipelineInfo3 = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shaderModule3,
+            .pName = "main"
+        },
+        .layout = pipelineLayout
+    };
+    VkPipeline computePipeline3;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo3, NULL, &computePipeline3));
+
+    /* Descriptor Pool */
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24 };
     VkDescriptorPoolCreateInfo poolInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 2,
@@ -532,17 +557,27 @@ int main(int argc, char** argv) {
     VK_CHECK(vkAllocateDescriptorSets(device, &allocSetInfo, descriptorSets));
 
     VkDescriptorBufferInfo offsetBufInfo = { offsetsBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo ryBufInfo = { intermediateBuffer, 0, ry_size };
+    VkDescriptorBufferInfo pExclBufInfo = { intermediateBuffer, ry_size, p_excl_size };
+    VkDescriptorBufferInfo sExclBufInfo = { intermediateBuffer, ry_size + p_excl_size, s_excl_size };
+    VkDescriptorBufferInfo totalsBufInfo = { intermediateBuffer, ry_size + p_excl_size + s_excl_size, totals_size };
+    VkDescriptorBufferInfo invBufInfo = { intermediateBuffer, ry_size + p_excl_size + s_excl_size + totals_size, inv_size };
 
     for (int i=0; i<2; i++) {
         VkDescriptorBufferInfo baseBufInfo = { basepointBuffer[i], 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo resultBufInfo = { resultBuffer[i], 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet descriptorWrites[3] = {
+        VkWriteDescriptorSet descriptorWrites[8] = {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &baseBufInfo, NULL },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &offsetBufInfo, NULL },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &resultBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &ryBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &pExclBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &sExclBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &totalsBufInfo, NULL },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, descriptorSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &invBufInfo, NULL }
         };
-        vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, NULL);
+        vkUpdateDescriptorSets(device, 8, descriptorWrites, 0, NULL);
     }
 
     /* Command Pool & Buffers (Double Buffered) */
@@ -563,16 +598,51 @@ int main(int argc, char** argv) {
     VkCommandBuffer commandBuffers[2];
     VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, commandBuffers));
 
-    /* Record Command Buffers */
+    /* Record Command Buffers - Chain 3 dispatches */
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = NULL,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+    };
+
     for (int i=0; i<2; i++) {
         VkCommandBufferBeginInfo beginInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         VK_CHECK(vkBeginCommandBuffer(commandBuffers[i], &beginInfo));
-        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+
+        // --- Pass 1: Scan ---
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline1);
         vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSets[i], 0, NULL);
-
         vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
-
         vkCmdDispatch(commandBuffers[i], BATCH_SIZE / WORKGROUP_SIZE, 1, 1);
+
+        // Barrier 1
+        vkCmdPipelineBarrier(commandBuffers[i],
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL
+        );
+
+        // --- Pass 2: Invert ---
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline2);
+        vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSets[i], 0, NULL);
+        vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
+        // Dispatch 1 thread per group (Pass 2 WG_SIZE=64)
+        vkCmdDispatch(commandBuffers[i], (BATCH_SIZE / WORKGROUP_SIZE + 63) / 64, 1, 1);
+
+        // Barrier 2
+        vkCmdPipelineBarrier(commandBuffers[i],
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL
+        );
+
+        // --- Pass 3: Finalize ---
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline3);
+        vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSets[i], 0, NULL);
+        vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc_data);
+        vkCmdDispatch(commandBuffers[i], BATCH_SIZE / WORKGROUP_SIZE, 1, 1);
+
         VK_CHECK(vkEndCommandBuffer(commandBuffers[i]));
     }
 
@@ -580,10 +650,6 @@ int main(int argc, char** argv) {
     VkFence fences[2];
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[0]));
     VK_CHECK(vkCreateFence(device, &fenceInfo, NULL, &fences[1]));
-
-    if (print_stats) {
-        printf("Starting search for prefix '%s' via Vulkan...\n\n", prefix);
-    }
 
     uint64_t total_checked = 0;
     uint32_t found_count = 0;
@@ -608,8 +674,6 @@ int main(int argc, char** argv) {
     randombytes_buf(base_secret[0], 32);
     crypto_hash_sha512(h_scalars[0], base_secret[0], 32);
     h_scalars[0][0] &= 248; h_scalars[0][31] &= 127; h_scalars[0][31] |= 64;
-
-    /* We MUST reduce the scalar mod L so sc_muladd works properly later! */
     sc_reduce(h_scalars[0]);
 
     ge_p3 base_p3;
@@ -630,8 +694,6 @@ int main(int argc, char** argv) {
         randombytes_buf(base_secret[next_frame], 32);
         crypto_hash_sha512(h_scalars[next_frame], base_secret[next_frame], 32);
         h_scalars[next_frame][0] &= 248; h_scalars[next_frame][31] &= 127; h_scalars[next_frame][31] |= 64;
-
-        /* We MUST reduce the scalar mod L so sc_muladd works properly later! */
         sc_reduce(h_scalars[next_frame]);
 
         ge_scalarmult_base(&base_p3, h_scalars[next_frame]);
@@ -667,9 +729,6 @@ int main(int argc, char** argv) {
         if (result_index != -1) {
             found_count++;
             unsigned char* h = h_scalars[cur_frame];
-            /* To get the actual secret, we take our base scalar `h` */
-            /* and add `result_index * 8` to it. */
-            /* We use sc_muladd to safely add in the scalar field. */
             unsigned char offset_scalar[32] = {0};
             uint32_t offset_val = result_index * 8;
             offset_scalar[0] = (offset_val >> 0) & 0xff;
@@ -678,18 +737,14 @@ int main(int argc, char** argv) {
             offset_scalar[3] = (offset_val >> 24) & 0xff;
 
             unsigned char final_scalar[32];
-            /* In orlp/ed25519 (ref10), sc_muladd(s, a, b, c) calculates s = (a * b + c) mod L */
-            /* We want h + offset_scalar. So a = offset_scalar, b = 1, c = h */
             const unsigned char one[32] = {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
             sc_muladd(final_scalar, offset_scalar, one, h);
 
-            /* We need the matching public key to save it in Tor format */
             ge_p3 match_p3;
             ge_scalarmult_base(&match_p3, final_scalar);
             unsigned char match_pubkey[32];
             ge_p3_tobytes(match_pubkey, &match_p3);
 
-            /* Compute the checksum and build the full onion string using pure SHA3-256 */
             unsigned char checksum_input[50];
             memcpy(checksum_input, ".onion checksum", 15);
             memcpy(checksum_input + 15, match_pubkey, 32);
@@ -701,7 +756,6 @@ int main(int argc, char** argv) {
             ((uint8_t*)state)[48] ^= 0x06;
             ((uint8_t*)state)[135] ^= 0x80;
 
-            /* Keccak-f[1600] rounds */
             const uint64_t RC[24] = {
                 0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
                 0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
@@ -765,15 +819,15 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            FILE* f = fopen(key_path, "wb");
-            if (f) {
+            FILE* f_ptr = fopen(key_path, "wb");
+            if (f_ptr) {
                 char header[32] = "== ed25519v1-secret: type0 ==\0\0\0";
-                fwrite(header, 1, 32, f);
+                fwrite(header, 1, 32, f_ptr);
                 unsigned char expanded_sk[64];
                 memcpy(expanded_sk, final_scalar, 32);
                 memcpy(expanded_sk + 32, match_pubkey, 32);
-                fwrite(expanded_sk, 1, 64, f);
-                fclose(f);
+                fwrite(expanded_sk, 1, 64, f_ptr);
+                fclose(f_ptr);
 
                 if (!print_stats) {
                     printf("%s.onion\n", pubkey_b32);
@@ -781,7 +835,6 @@ int main(int argc, char** argv) {
                 }
             }
 
-            /* DO NOT exit. Just clear the result index and keep searching. */
             int clr_res = -1;
             memcpy(mappedResult[cur_frame], &clr_res, sizeof(int));
         }
@@ -801,10 +854,14 @@ int main(int argc, char** argv) {
 
     vkDestroyCommandPool(device, commandPool, NULL);
     vkDestroyDescriptorPool(device, descriptorPool, NULL);
-    vkDestroyPipeline(device, computePipeline, NULL);
+    vkDestroyPipeline(device, computePipeline1, NULL);
+    vkDestroyPipeline(device, computePipeline2, NULL);
+    vkDestroyPipeline(device, computePipeline3, NULL);
     vkDestroyPipelineLayout(device, pipelineLayout, NULL);
     vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
-    vkDestroyShaderModule(device, computeShaderModule, NULL);
+    vkDestroyShaderModule(device, shaderModule1, NULL);
+    vkDestroyShaderModule(device, shaderModule2, NULL);
+    vkDestroyShaderModule(device, shaderModule3, NULL);
 
     for (int i=0; i<2; i++) {
         vkDestroyBuffer(device, basepointBuffer[i], NULL);
@@ -816,6 +873,8 @@ int main(int argc, char** argv) {
 
     vkDestroyBuffer(device, offsetsBuffer, NULL);
     vkFreeMemory(device, offsetsMemory, NULL);
+    vkDestroyBuffer(device, intermediateBuffer, NULL);
+    vkFreeMemory(device, intermediateMemory, NULL);
 
     vkDestroyDevice(device, NULL);
     vkDestroyInstance(instance, NULL);
